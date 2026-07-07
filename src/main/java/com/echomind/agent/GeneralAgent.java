@@ -4,8 +4,8 @@ import com.echomind.llm.LlmGateway;
 
 public class GeneralAgent extends BaseAgent {
 
-    public GeneralAgent(LlmGateway llmGateway) {
-        super(llmGateway);
+    public GeneralAgent(LlmGateway llmGateway, AgentToolService toolService) {
+        super(llmGateway, toolService);
     }
 
     @Override

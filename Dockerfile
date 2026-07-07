@@ -8,5 +8,6 @@ FROM eclipse-temurin:21-jre
 WORKDIR /app
 ENV JAVA_OPTS=""
 COPY --from=build /workspace/target/echomind-java-0.1.0.jar /app/echomind-java.jar
+COPY skills ./skills
 EXPOSE 8080
 ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /app/echomind-java.jar"]

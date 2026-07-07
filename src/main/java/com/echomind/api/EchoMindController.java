@@ -4,42 +4,33 @@ import com.echomind.agent.AgentOrchestrator;
 import com.echomind.agent.AgentRequest;
 import com.echomind.agent.AnswerVerifier;
 import com.echomind.agent.OrchestratorResult;
-import com.echomind.api.dto.BatchDocInput;
 import com.echomind.api.dto.ChatRequest;
 import com.echomind.api.dto.ChatResponse;
-import com.echomind.api.dto.EvalRunRequest;
-import com.echomind.evaluation.EndToEndEvaluator;
+import com.echomind.api.dto.KnowledgeSource;
+import com.echomind.config.EchoMindProperties;
 import com.echomind.knowledge.KnowledgeBaseService;
 import com.echomind.knowledge.SearchResult;
 import com.echomind.memory.MemoryContext;
 import com.echomind.memory.MemoryManager;
 import com.echomind.memory.MessageRole;
-import com.echomind.monitor.PerformanceMonitor;
 import com.echomind.tool.KnowledgeToolManager;
 import com.echomind.tool.ToolResult;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import io.swagger.v3.oas.annotations.Operation;
-import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
-import org.springframework.http.ResponseEntity;
-import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.multipart.MultipartFile;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 @RestController
-@Tag(name = "EchoMind API", description = "智能客服对话、知识库、监控和评测接口")
+@Tag(name = "Chat", description = "Conversation and health endpoints")
 public class EchoMindController {
 
     private final AgentOrchestrator orchestrator;
@@ -47,10 +38,8 @@ public class EchoMindController {
     private final KnowledgeToolManager knowledgeToolManager;
     private final KnowledgeBaseService knowledgeBaseService;
     private final AnswerVerifier answerVerifier;
-    private final PerformanceMonitor performanceMonitor;
-    private final EndToEndEvaluator evaluator;
+    private final EchoMindProperties properties;
     private final ObjectMapper objectMapper;
-    private final PrometheusMeterRegistry prometheusMeterRegistry;
 
     public EchoMindController(
             AgentOrchestrator orchestrator,
@@ -58,30 +47,26 @@ public class EchoMindController {
             KnowledgeToolManager knowledgeToolManager,
             KnowledgeBaseService knowledgeBaseService,
             AnswerVerifier answerVerifier,
-            PerformanceMonitor performanceMonitor,
-            EndToEndEvaluator evaluator,
-            ObjectMapper objectMapper,
-            PrometheusMeterRegistry prometheusMeterRegistry
+            EchoMindProperties properties,
+            ObjectMapper objectMapper
     ) {
         this.orchestrator = orchestrator;
         this.memoryManager = memoryManager;
         this.knowledgeToolManager = knowledgeToolManager;
         this.knowledgeBaseService = knowledgeBaseService;
         this.answerVerifier = answerVerifier;
-        this.performanceMonitor = performanceMonitor;
-        this.evaluator = evaluator;
+        this.properties = properties;
         this.objectMapper = objectMapper;
-        this.prometheusMeterRegistry = prometheusMeterRegistry;
     }
 
     @GetMapping("/health")
-    @Operation(summary = "健康检查", description = "返回服务状态和 Agent 路由统计。")
+    @Operation(summary = "Health check")
     public Map<String, Object> health() {
         return Map.of("status", "ok", "agents", orchestrator.stats());
     }
 
     @PostMapping("/chat")
-    @Operation(summary = "智能客服对话", description = "执行完整对话链路：记忆读取、知识库检索、意图识别、多 Agent 路由、回答校验和记忆写入。")
+    @Operation(summary = "Run a customer-support conversation turn")
     public ChatResponse chat(@Valid @RequestBody ChatRequest request) {
         String userId = request.userIdOrDefault();
         String conversationId = request.conversationId() == null || request.conversationId().isBlank()
@@ -89,21 +74,36 @@ public class EchoMindController {
                 : request.conversationId();
         MemoryContext memoryContext = memoryManager.getContext(userId, conversationId, request.message());
         String memoryText = memoryContext.toPromptText(objectMapper);
-        ToolResult<List<SearchResult>> knowledge = shouldUseKnowledge(request.message())
+
+        boolean requiresKnowledge = shouldUseKnowledge(request.message());
+        ToolResult<List<SearchResult>> knowledge = requiresKnowledge
                 ? knowledgeToolManager.searchWithRewrite(request.message(), 3)
                 : new ToolResult<>(true, List.of(), "knowledge_search", null, false, 0, false);
-        String knowledgeText = buildKnowledgeContext(knowledge.data());
-        String fullContext = join(memoryText, knowledgeText);
+        List<SearchResult> usefulKnowledge = usefulKnowledge(knowledge.data());
+        List<SearchResult> contextKnowledge = knowledgeBaseService.expandWithNeighbors(usefulKnowledge, properties.getRag().getContextWindow());
+        List<KnowledgeSource> knowledgeSources = contextKnowledge.stream().map(KnowledgeSource::from).toList();
+        boolean knowledgeSufficient = !requiresKnowledge || knowledgeSufficient(usefulKnowledge);
+        String knowledgeWarning = knowledgeWarning(requiresKnowledge, usefulKnowledge, knowledgeSufficient);
+        String knowledgeText = buildKnowledgeContext(contextKnowledge.isEmpty() ? knowledge.data() : contextKnowledge);
+        String fullContext = join(join(memoryText, knowledgeText), knowledgeWarningPrompt(knowledgeWarning));
+
         List<Map<String, String>> history = memoryContext.recentMessages().stream()
                 .skip(Math.max(0, memoryContext.recentMessages().size() - 5))
                 .map(m -> Map.of("role", m.role().name().toLowerCase(), "content", m.content()))
                 .toList();
         OrchestratorResult result = orchestrator.run(AgentRequest.of(request.message(), userId, conversationId, fullContext, history));
         AnswerVerifier.VerificationResult verification = answerVerifier.verify(request.message(), result.response(), fullContext);
-        boolean escalated = result.escalated() || verification.needEscalation();
+        boolean escalated = result.escalated() || verification.needEscalation() || (requiresKnowledge && !knowledgeSufficient);
+        List<String> toolErrors = result.toolCalls().stream()
+                .filter(call -> !call.success() && !call.error().isBlank())
+                .map(call -> call.server() + "." + call.tool() + ": " + call.error())
+                .toList();
+        long toolLatencyMs = result.toolCalls().stream().mapToLong(call -> call.latencyMs()).sum();
+
         memoryManager.addMessage(userId, conversationId, MessageRole.USER, request.message());
         memoryManager.addMessage(userId, conversationId, MessageRole.ASSISTANT, result.response());
         memoryManager.updateProfile(userId, conversationId);
+
         return new ChatResponse(
                 conversationId,
                 result.response(),
@@ -111,72 +111,62 @@ public class EchoMindController {
                 result.agentType().name().toLowerCase(),
                 escalated,
                 result.latencyMs(),
-                knowledge.data() != null && !knowledge.data().isEmpty(),
+                !knowledgeSources.isEmpty(),
+                knowledgeSources,
+                knowledgeSufficient,
+                knowledgeWarning,
                 verification.pass(),
-                verification.grounded()
+                verification.grounded() && knowledgeSufficient,
+                verification.reason(),
+                !result.toolCalls().isEmpty(),
+                result.toolCalls(),
+                toolErrors,
+                toolLatencyMs
         );
     }
 
-    @PostMapping("/search")
-    @Operation(summary = "知识库检索", description = "对用户查询做查询改写、并行召回和 LLM rerank。")
-    public Map<String, Object> search(
-            @Parameter(description = "检索关键词或用户问题", example = "退款多久能到账") @RequestParam String query,
-            @Parameter(description = "返回结果数量", example = "5") @RequestParam(defaultValue = "5") int topK) {
-        ToolResult<List<SearchResult>> result = knowledgeToolManager.searchWithRewrite(query, topK);
-        return Map.of("query", query, "results", result.data(), "reranked", result.reranked());
-    }
-
-    @PostMapping("/knowledge/add")
-    @Operation(summary = "批量添加知识文档", description = "将文档切片后写入 Java 版持久化知识库。")
-    public Map<String, Object> addKnowledge(@Valid @RequestBody BatchDocInput input) {
-        List<Map<String, String>> docs = input.documents().stream()
-                .map(d -> Map.of("title", d.title(), "content", d.content()))
+    private List<SearchResult> usefulKnowledge(List<SearchResult> results) {
+        if (results == null || results.isEmpty()) {
+            return List.of();
+        }
+        return results.stream()
+                .filter(result -> result != null && !isFallbackKnowledge(result) && result.score() > 0.0)
                 .toList();
-        int added = knowledgeBaseService.addDocuments(docs);
-        return Map.of("added_chunks", added, "total_chunks", knowledgeBaseService.docCount());
     }
 
-    @PostMapping(value = "/knowledge/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    @Operation(summary = "上传知识库文件", description = "支持上传 .txt、.md、.json 文件，最大 10MB。JSON 文件格式为数组：[{\"title\":\"...\",\"content\":\"...\"}]。")
-    public Map<String, Object> uploadKnowledge(@Parameter(description = "知识库文件") @RequestParam("file") MultipartFile file) throws Exception {
-        if (file.getSize() > 10L * 1024 * 1024) {
-            throw new IllegalArgumentException("文件大小超过 10MB 限制");
+    private boolean knowledgeSufficient(List<SearchResult> results) {
+        if (results == null || results.isEmpty()) {
+            return false;
         }
-        String filename = file.getOriginalFilename() == null ? "unknown" : file.getOriginalFilename();
-        String text = new String(file.getBytes(), java.nio.charset.StandardCharsets.UTF_8);
-        List<Map<String, String>> docs;
-        if (filename.endsWith(".json")) {
-            docs = parseJsonDocs(text);
-        } else {
-            String title = filename.contains(".") ? filename.substring(0, filename.lastIndexOf('.')) : filename;
-            docs = List.of(Map.of("title", title, "content", text));
+        double minScore = Math.max(0.0, properties.getRag().getMinRelevantScore());
+        int minSources = Math.max(1, properties.getRag().getMinSources());
+        long relevant = results.stream().filter(result -> result.score() >= minScore).count();
+        return relevant >= minSources;
+    }
+
+    private String knowledgeWarning(boolean requiresKnowledge, List<SearchResult> results, boolean sufficient) {
+        if (!requiresKnowledge || sufficient) {
+            return "";
         }
-        int added = knowledgeBaseService.addDocuments(docs);
-        return Map.of("message", "文件 " + filename + " 导入成功", "added_chunks", added, "total_chunks", knowledgeBaseService.docCount());
+        double topScore = results == null || results.isEmpty()
+                ? 0.0
+                : results.stream().mapToDouble(SearchResult::score).max().orElse(0.0);
+        return "Knowledge evidence is insufficient for a grounded answer. top_score="
+                + topScore
+                + ", min_relevant_score="
+                + properties.getRag().getMinRelevantScore()
+                + ". The assistant should avoid unsupported claims and suggest human escalation when needed.";
     }
 
-    @GetMapping("/knowledge/stats")
-    @Operation(summary = "知识库统计", description = "返回当前知识库片段数量。")
-    public Map<String, Object> knowledgeStats() {
-        return Map.of("total_chunks", knowledgeBaseService.docCount());
+    private String knowledgeWarningPrompt(String warning) {
+        if (warning == null || warning.isBlank()) {
+            return "";
+        }
+        return "[Knowledge Safety]\n" + warning + "\nDo not invent policy details that are not supported by the retrieved knowledge.";
     }
 
-    @GetMapping("/monitor")
-    @Operation(summary = "监控摘要", description = "返回 Agent 指标、工具统计、告警和优化建议。")
-    public Map<String, Object> monitor() {
-        return performanceMonitor.summary();
-    }
-
-    @GetMapping(value = "/metrics", produces = "text/plain; version=0.0.4; charset=utf-8")
-    @Operation(summary = "Prometheus 指标", description = "返回 Prometheus 文本格式指标，兼容 Python 版 /metrics 路径。")
-    public ResponseEntity<String> metrics() {
-        return ResponseEntity.ok(prometheusMeterRegistry.scrape());
-    }
-
-    @PostMapping(value = "/eval/run", consumes = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(summary = "运行评测", description = "运行意图识别和对话质量评测；请求体为空时使用内置默认用例。")
-    public Map<String, Object> eval(@RequestBody(required = false) EvalRunRequest request) {
-        return evaluator.run(request);
+    private boolean isFallbackKnowledge(SearchResult result) {
+        return result.metadata() != null && Boolean.TRUE.equals(result.metadata().get("fallback"));
     }
 
     private boolean shouldUseKnowledge(String message) {
@@ -192,12 +182,18 @@ public class EchoMindController {
             return "";
         }
         List<String> parts = new ArrayList<>();
-        parts.add("[知识库检索结果]");
+        parts.add("[Knowledge Results]");
         for (int i = 0; i < results.size(); i++) {
             SearchResult item = results.get(i);
-            parts.add((i + 1) + ". 标题: " + item.title() + "\n   相关度: " + item.score() + "\n   内容: " + item.content());
+            Object source = item.metadata() == null ? "" : item.metadata().getOrDefault("source", "");
+            Object headingPath = item.metadata() == null ? "" : item.metadata().getOrDefault("heading_path", "");
+            parts.add((i + 1) + ". Title: " + item.title()
+                    + "\n   Source: " + source
+                    + "\n   Section: " + headingPath
+                    + "\n   Score: " + item.score()
+                    + "\n   Content: " + item.content());
         }
-        parts.add("请优先依据以上知识库内容回答；如果知识库内容不足，再结合通用客服能力说明。");
+        parts.add("Answer using the knowledge above first. If it is insufficient, say so and recommend human escalation.");
         return String.join("\n", parts);
     }
 
@@ -209,22 +205,5 @@ public class EchoMindController {
             return left;
         }
         return left + "\n\n" + right;
-    }
-
-    @SuppressWarnings("unchecked")
-    private List<Map<String, String>> parseJsonDocs(String text) throws Exception {
-        List<?> values = objectMapper.readValue(text, List.class);
-        List<Map<String, String>> docs = new ArrayList<>();
-        for (Object value : values) {
-            if (value instanceof Map<?, ?> map) {
-                Map<String, String> doc = new LinkedHashMap<>();
-                Object title = map.containsKey("title") ? map.get("title") : "未命名文档";
-                Object content = map.containsKey("content") ? map.get("content") : "";
-                doc.put("title", String.valueOf(title));
-                doc.put("content", String.valueOf(content));
-                docs.add(doc);
-            }
-        }
-        return docs;
     }
 }

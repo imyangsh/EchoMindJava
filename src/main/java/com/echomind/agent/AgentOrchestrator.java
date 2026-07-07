@@ -55,7 +55,8 @@ public class AgentOrchestrator {
                 response.agentType(),
                 req.intent(),
                 escalated,
-                Duration.between(start, Instant.now()).toMillis()
+                Duration.between(start, Instant.now()).toMillis(),
+                response.toolCalls()
         );
     }
 
@@ -71,7 +72,10 @@ public class AgentOrchestrator {
                 .orElse("抱歉，所有 Agent 均处理失败。");
         boolean escalate = responses.stream().anyMatch(AgentResponse::escalate);
         long latency = responses.stream().mapToLong(AgentResponse::latencyMs).max().orElse(0);
-        return new AgentResponse(targets.getFirst(), content, true, 1.0, latency, escalate);
+        List<ToolCallTrace> toolCalls = responses.stream()
+                .flatMap(response -> response.toolCalls().stream())
+                .toList();
+        return new AgentResponse(targets.getFirst(), content, true, 1.0, latency, escalate, toolCalls);
     }
 
     private AgentType route(IntentCategory intent, UrgencyLevel urgency) {

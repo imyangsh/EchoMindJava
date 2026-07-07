@@ -8,10 +8,12 @@ import java.time.Instant;
 public abstract class BaseAgent {
 
     private final LlmGateway llmGateway;
+    private final AgentToolService toolService;
     private final AgentStats stats = new AgentStats();
 
-    protected BaseAgent(LlmGateway llmGateway) {
+    protected BaseAgent(LlmGateway llmGateway, AgentToolService toolService) {
         this.llmGateway = llmGateway;
+        this.toolService = toolService;
     }
 
     public abstract AgentType type();
@@ -22,11 +24,11 @@ public abstract class BaseAgent {
         Instant start = Instant.now();
         try {
             String prompt = buildPrompt(request);
-            String content = llmGateway.chat(systemPrompt(), prompt, 0.2, 1024);
+            AgentToolService.GenerationResult generation = toolService.generate(type(), systemPrompt(), request, prompt, llmGateway);
             long latency = Duration.between(start, Instant.now()).toMillis();
-            boolean escalate = needsEscalation(content);
+            boolean escalate = needsEscalation(generation.content());
             stats.record(true, latency);
-            return new AgentResponse(type(), content, true, 1.0, latency, escalate);
+            return new AgentResponse(type(), generation.content(), true, 1.0, latency, escalate, generation.toolCalls());
         } catch (Exception ex) {
             long latency = Duration.between(start, Instant.now()).toMillis();
             stats.record(false, latency);
@@ -41,9 +43,9 @@ public abstract class BaseAgent {
     private String buildPrompt(AgentRequest request) {
         StringBuilder prompt = new StringBuilder();
         if (request.context() != null && !request.context().isBlank()) {
-            prompt.append("[背景信息]\n").append(request.context()).append("\n\n");
+            prompt.append("[Context]\n").append(request.context()).append("\n\n");
         }
-        prompt.append("[用户问题]\n").append(request.message());
+        prompt.append("[User]\n").append(request.message());
         return prompt.toString();
     }
 

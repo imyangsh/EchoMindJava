@@ -4,8 +4,8 @@ import com.echomind.llm.LlmGateway;
 
 public class BillingAgent extends BaseAgent {
 
-    public BillingAgent(LlmGateway llmGateway) {
-        super(llmGateway);
+    public BillingAgent(LlmGateway llmGateway, AgentToolService toolService) {
+        super(llmGateway, toolService);
     }
 
     @Override

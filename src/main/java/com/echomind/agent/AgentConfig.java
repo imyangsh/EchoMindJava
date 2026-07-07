@@ -11,11 +11,14 @@ import java.util.Map;
 public class AgentConfig {
 
     @Bean
-    Map<AgentType, List<BaseAgent>> agentPool(LlmGateway llmGateway) {
+    Map<AgentType, List<BaseAgent>> agentPool(
+            LlmGateway llmGateway,
+            AgentToolService toolService
+    ) {
         return Map.of(
-                AgentType.GENERAL, List.of(new GeneralAgent(llmGateway)),
-                AgentType.TECHNICAL, List.of(new TechnicalAgent(llmGateway)),
-                AgentType.BILLING, List.of(new BillingAgent(llmGateway))
+                AgentType.GENERAL, List.of(new GeneralAgent(llmGateway, toolService)),
+                AgentType.TECHNICAL, List.of(new TechnicalAgent(llmGateway, toolService)),
+                AgentType.BILLING, List.of(new BillingAgent(llmGateway, toolService))
         );
     }
 }
