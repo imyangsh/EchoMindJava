@@ -1,5 +1,7 @@
 package com.echomind.intent;
 
+import com.echomind.config.EchoMindProperties;
+import com.echomind.knowledge.TextEmbeddingService;
 import com.echomind.llm.LlmGateway;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -7,7 +9,6 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
@@ -18,25 +19,19 @@ import java.util.concurrent.ConcurrentHashMap;
 @Service
 public class IntentRecognizer {
 
-    private static final Map<IntentCategory, List<String>> TEMPLATES = Map.of(
-            IntentCategory.QUERY, List.of("我的订单状态是什么", "如何重置密码", "快递什么时候到"),
-            IntentCategory.COMPLAINT, List.of("服务太差了", "一直没人处理", "等了好几个小时"),
-            IntentCategory.REQUEST, List.of("帮我取消订单", "我需要修改地址", "请协助退款"),
-            IntentCategory.GREETING, List.of("你好", "嗨有人吗", "hello"),
-            IntentCategory.ESCALATION, List.of("转人工客服", "我要投诉", "找你们经理"),
-            IntentCategory.TECHNICAL, List.of("应用一直崩溃", "无法登录", "出现500错误"),
-            IntentCategory.BILLING, List.of("为什么扣了两次款", "申请退款", "发票问题"),
-            IntentCategory.ACCOUNT, List.of("修改邮箱", "注销账户", "更新个人信息"),
-            IntentCategory.FEEDBACK, List.of("服务很棒", "非常满意", "给个好评")
-    );
-
     private final LlmGateway llmGateway;
     private final ObjectMapper objectMapper;
+    private final IntentSampleStore sampleStore;
+    private final TextEmbeddingService embeddingService;
+    private final EchoMindProperties properties;
     private final Map<String, IntentResult> cache = new ConcurrentHashMap<>();
 
-    public IntentRecognizer(LlmGateway llmGateway, ObjectMapper objectMapper) {
+    public IntentRecognizer(LlmGateway llmGateway, ObjectMapper objectMapper, IntentSampleStore sampleStore, TextEmbeddingService embeddingService, EchoMindProperties properties) {
         this.llmGateway = llmGateway;
         this.objectMapper = objectMapper;
+        this.sampleStore = sampleStore;
+        this.embeddingService = embeddingService;
+        this.properties = properties;
     }
 
     public IntentResult recognize(String message, List<Map<String, String>> history) {
@@ -68,7 +63,7 @@ public class IntentRecognizer {
 
     private Map<String, Object> llmRecognize(String message, List<Map<String, String>> history) {
         StringBuilder examples = new StringBuilder();
-        TEMPLATES.forEach((intent, samples) ->
+        sampleStore.samples().forEach((intent, samples) ->
                 examples.append("消息: \"").append(samples.getFirst()).append("\" -> 意图: ")
                         .append(intent.name().toLowerCase(Locale.ROOT)).append('\n'));
         String prompt = """
@@ -101,16 +96,19 @@ public class IntentRecognizer {
     private Map<String, Object> semanticRecognize(String message) {
         IntentCategory best = IntentCategory.OTHER;
         double bestScore = 0.0;
-        for (Map.Entry<IntentCategory, List<String>> entry : TEMPLATES.entrySet()) {
+        String matchedSample = "";
+        double[] messageEmbedding = embeddingService.embed(message);
+        for (Map.Entry<IntentCategory, List<String>> entry : sampleStore.samples().entrySet()) {
             for (String sample : entry.getValue()) {
-                double score = jaccard(charNgrams(message), charNgrams(sample));
+                double score = Math.max(0.0, embeddingService.cosine(messageEmbedding, embeddingService.embed(sample)));
                 if (score > bestScore) {
                     bestScore = score;
                     best = entry.getKey();
+                    matchedSample = sample;
                 }
             }
         }
-        return Map.of("intent", best, "confidence", bestScore);
+        return Map.of("intent", best, "confidence", bestScore, "matched_sample", matchedSample);
     }
 
     private Map<String, Object> patternRecognize(String message) {
@@ -142,7 +140,14 @@ public class IntentRecognizer {
 
     private IntentCategory vote(Map<String, Object> llm, Map<String, Object> semantic, Map<String, Object> pattern) {
         if (Boolean.TRUE.equals(llm.get("failed"))) {
-            return (IntentCategory) pattern.getOrDefault("intent", IntentCategory.OTHER);
+            return fallbackVote(semantic, pattern);
+        }
+        IntentCategory llmIntent = (IntentCategory) llm.getOrDefault("intent", IntentCategory.OTHER);
+        double llmConfidence = ((Number) llm.getOrDefault("confidence", 0.0)).doubleValue();
+        double semanticConfidence = ((Number) semantic.getOrDefault("confidence", 0.0)).doubleValue();
+        if ((llmIntent == IntentCategory.OTHER || llmConfidence < 0.35)
+                && semanticConfidence >= properties.getIntent().getSemanticThreshold()) {
+            return (IntentCategory) semantic.getOrDefault("intent", IntentCategory.OTHER);
         }
         Map<IntentCategory, Double> scores = new EnumMap<>(IntentCategory.class);
         addScore(scores, llm, 0.70);
@@ -153,6 +158,14 @@ public class IntentRecognizer {
                 .filter(e -> e.getValue() >= 0.35)
                 .map(Map.Entry::getKey)
                 .orElse(IntentCategory.OTHER);
+    }
+
+    private IntentCategory fallbackVote(Map<String, Object> semantic, Map<String, Object> pattern) {
+        double semanticConfidence = ((Number) semantic.getOrDefault("confidence", 0.0)).doubleValue();
+        if (semanticConfidence >= properties.getIntent().getSemanticThreshold()) {
+            return (IntentCategory) semantic.getOrDefault("intent", IntentCategory.OTHER);
+        }
+        return (IntentCategory) pattern.getOrDefault("intent", IntentCategory.OTHER);
     }
 
     private void addScore(Map<IntentCategory, Double> scores, Map<String, Object> result, double weight) {
@@ -172,7 +185,7 @@ public class IntentRecognizer {
 
     private List<String> regexFind(String text, String regex) {
         java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(regex, java.util.regex.Pattern.CASE_INSENSITIVE).matcher(text == null ? "" : text);
-        List<String> values = new ArrayList<>();
+        java.util.List<String> values = new java.util.ArrayList<>();
         while (matcher.find()) {
             values.add(matcher.group());
         }
@@ -208,28 +221,6 @@ public class IntentRecognizer {
             return raw.substring(start, end + 1);
         }
         return "{}";
-    }
-
-    private List<String> charNgrams(String text) {
-        String normalized = normalize(text);
-        List<String> grams = new ArrayList<>();
-        for (int n = 1; n <= 3; n++) {
-            for (int i = 0; i + n <= normalized.length(); i++) {
-                grams.add(normalized.substring(i, i + n));
-            }
-        }
-        return grams;
-    }
-
-    private double jaccard(List<String> left, List<String> right) {
-        if (left.isEmpty() || right.isEmpty()) {
-            return 0.0;
-        }
-        java.util.Set<String> a = new java.util.HashSet<>(left);
-        java.util.Set<String> b = new java.util.HashSet<>(right);
-        long intersection = a.stream().filter(b::contains).count();
-        long union = a.size() + b.size() - intersection;
-        return union == 0 ? 0.0 : (double) intersection / union;
     }
 
     private String normalize(String value) {

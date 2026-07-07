@@ -6,9 +6,9 @@ EchoMind Java 是一个基于 Spring Boot 的智能客服 Agent 项目。它围�
 
 - General / Technical / Billing 多 Agent 路由
 - Redis 工作记忆、长期记忆和用户画像持久化
-- Hybrid RAG：BM25、hash vector、可选 ChromaDB 召回、LLM rerank
+- Hybrid RAG：BM25、EmbeddingModel / hash vector、可选 ChromaDB 召回、RRF 融合、LLM rerank
 - 知识库来源引用、上下文窗口扩展、证据不足降级
-- 动态 Skills 注入
+- 外置意图样本、Embedding 语义匹配和动态 Skills 注入
 - MCP stdio / HTTP / SSE 工具调用
 - MCP allowlist / denylist / read-only / dangerous 工具策略
 - MCP tool `inputSchema` 参数校验
@@ -24,7 +24,7 @@ EchoMind Java 是一个基于 Spring Boot 的智能客服 Agent 项目。它围�
 | Runtime | Java 21 |
 | Web | Spring Boot 3.5, Spring MVC |
 | LLM | Spring AI Anthropic, Spring AI DeepSeek |
-| RAG | BM25, local hash vector, Spring AI Chroma VectorStore, LLM rerank |
+| RAG | BM25, Spring AI EmbeddingModel, local hash vector fallback, Spring AI Chroma VectorStore, RRF/weighted fusion, LLM rerank |
 | Memory | Redis + JSON store |
 | Tools | AgentToolRegistry, MCP stdio/http/sse |
 | API Docs | Springdoc OpenAPI, Swagger UI |
@@ -41,7 +41,7 @@ POST /chat
   -> KnowledgeToolManager
      查询改写、并行召回、缓存、熔断、rerank
   -> KnowledgeBaseService
-     BM25 + ChromaDB 可选召回 + hash vector 融合
+     BM25 + EmbeddingModel / hash vector + ChromaDB 可选召回 + RRF 融合
   -> AgentOrchestrator
      意图识别、Agent 路由、复合问题并行处理
   -> BaseAgent
@@ -66,6 +66,8 @@ POST /chat
 | 工具规划执行 | `src/main/java/com/echomind/agent/AgentToolService.java` |
 | 工具注册表 | `src/main/java/com/echomind/agent/AgentToolRegistry.java` |
 | RAG 检索 | `src/main/java/com/echomind/knowledge/KnowledgeBaseService.java` |
+| 文本向量 | `src/main/java/com/echomind/knowledge/TextEmbeddingService.java` |
+| 意图样本 | `src/main/resources/intent-samples.json` |
 | MCP 客户端 | `src/main/java/com/echomind/mcp/` |
 | Skills 加载 | `src/main/java/com/echomind/skill/SkillManager.java` |
 
@@ -290,13 +292,16 @@ curl -X POST http://localhost:8080/knowledge/upload \
   -> LLM 查询改写
   -> 多子查询并行召回
   -> BM25 关键词得分
+  -> Spring AI EmbeddingModel 语义向量（可用时）
   -> ChromaDB / Spring AI VectorStore 语义召回（可用时）
-  -> 本地 hash vector 兜底召回
-  -> 加权融合
+  -> 本地 hash vector 兜底召回（无 EmbeddingModel 时）
+  -> RRF 或加权融合
   -> LLM rerank
   -> 命中 chunk 前后窗口扩展
   -> 返回 knowledge_sources / context_sources
 ```
+
+文本向量由 `TextEmbeddingService` 统一管理：如果 Spring 容器里存在 `EmbeddingModel`，优先使用真实 embedding；否则自动退回 256 维 hash embedding，保证本地开发和测试不依赖外部 embedding 服务。
 
 相关配置：
 
@@ -306,6 +311,8 @@ echomind:
     top-k: ${RAG_TOP_K:4}
     bm25-weight: ${RAG_BM25_WEIGHT:0.45}
     vector-weight: ${RAG_VECTOR_WEIGHT:0.55}
+    fusion-strategy: ${RAG_FUSION_STRATEGY:rrf}
+    rrf-k: ${RAG_RRF_K:60}
     min-relevant-score: ${RAG_MIN_RELEVANT_SCORE:0.18}
     min-sources: ${RAG_MIN_SOURCES:1}
     context-window: ${RAG_CONTEXT_WINDOW:1}
@@ -318,6 +325,33 @@ echomind:
 - Agent prompt 注入 Knowledge Safety 提示
 - `grounded` 会被压成 `false`
 - 对话会倾向转人工确认，避免编造政策细节
+
+## 意图识别
+
+意图识别由 `IntentRecognizer` 负责，当前采用组合策略：
+
+```text
+用户消息
+  -> LLM 意图判断
+  -> intent-samples.json 样本语义匹配
+  -> 关键词规则兜底
+  -> 置信度校准和投票
+```
+
+语义匹配使用 `TextEmbeddingService`。有可用 `EmbeddingModel` 时使用真实 embedding；没有时使用本地 hash embedding 兜底。样本文件默认位于：
+
+```text
+src/main/resources/intent-samples.json
+```
+
+相关配置：
+
+```yaml
+echomind:
+  intent:
+    samples-path: ${INTENT_SAMPLES_PATH:classpath:intent-samples.json}
+    semantic-threshold: ${INTENT_SEMANTIC_THRESHOLD:0.42}
+```
 
 ## Skills
 
@@ -485,6 +519,9 @@ curl -X POST http://localhost:8080/eval/run \
 - Intent Accuracy
 - Macro-F1
 - per-class Precision / Recall / F1
+- Retrieval Recall@K
+- Retrieval MRR
+- Retrieval Hit Rate
 - LLM-as-Judge 四维评分
 - baseline 保存和回归检测
 - 成功率阈值告警
@@ -509,6 +546,7 @@ Windows PowerShell：
 当前测试覆盖：
 
 - Skills 加载和匹配
+- 意图样本语义匹配
 - Agent 工具调用 trace
 - 统一 Agent Tool Registry
 - MCP allowlist / denylist / read-only / dangerous 策略
@@ -516,6 +554,7 @@ Windows PowerShell：
 - MCP stdio 集成测试
 - MCP HTTP / SSE 测试
 - RAG 切块、metadata、上下文扩展
+- RAG 检索评测指标
 
 ## 目录结构
 
@@ -550,6 +589,10 @@ src/main/java/com/echomind
 | `CHROMA_HOST` | `http://localhost` | Chroma host |
 | `CHROMA_PORT` | `8001` | Chroma port |
 | `ECHOMIND_DATA_DIR` | `data/java` | 数据目录 |
+| `RAG_FUSION_STRATEGY` | `rrf` | RAG 融合策略，支持 `rrf` / `weighted` |
+| `RAG_RRF_K` | `60` | RRF 排名平滑参数 |
+| `INTENT_SAMPLES_PATH` | `classpath:intent-samples.json` | 意图样本文件 |
+| `INTENT_SEMANTIC_THRESHOLD` | `0.42` | 意图语义匹配兜底阈值 |
 | `MCP_ENABLED` | `false` | 是否启用 MCP |
 | `MCP_AUTO_TOOL_ENABLED` | `true` | Agent 是否自动选择 MCP 工具 |
 

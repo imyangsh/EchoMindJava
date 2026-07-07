@@ -8,6 +8,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.echomind.intent.IntentRecognizer;
 import com.echomind.intent.IntentResult;
+import com.echomind.knowledge.KnowledgeBaseService;
+import com.echomind.knowledge.SearchResult;
 import org.springframework.stereotype.Service;
 
 import java.nio.file.Files;
@@ -29,13 +31,15 @@ public class EndToEndEvaluator {
     private final LLMJudge judge;
     private final ObjectMapper objectMapper;
     private final EchoMindProperties properties;
+    private final KnowledgeBaseService knowledgeBaseService;
 
-    public EndToEndEvaluator(IntentRecognizer intentRecognizer, AgentOrchestrator orchestrator, LLMJudge judge, ObjectMapper objectMapper, EchoMindProperties properties) {
+    public EndToEndEvaluator(IntentRecognizer intentRecognizer, AgentOrchestrator orchestrator, LLMJudge judge, ObjectMapper objectMapper, EchoMindProperties properties, KnowledgeBaseService knowledgeBaseService) {
         this.intentRecognizer = intentRecognizer;
         this.orchestrator = orchestrator;
         this.judge = judge;
         this.objectMapper = objectMapper;
         this.properties = properties;
+        this.knowledgeBaseService = knowledgeBaseService;
     }
 
     public Map<String, Object> run(EvalRunRequest request) {
@@ -45,6 +49,9 @@ public class EndToEndEvaluator {
         List<EvalRunRequest.DialogCase> dialogCases = request != null && request.dialogCases() != null
                 ? request.dialogCases()
                 : defaultDialogCases();
+        List<EvalRunRequest.RetrievalCase> retrievalCases = request != null && request.retrievalCases() != null
+                ? request.retrievalCases()
+                : defaultRetrievalCases();
         List<Map<String, Object>> results = new ArrayList<>();
         List<String> predictions = new ArrayList<>();
         List<String> groundTruth = new ArrayList<>();
@@ -65,6 +72,7 @@ public class EndToEndEvaluator {
                     "metadata", Map.of("message", c.message(), "expected", c.expectedIntent(), "predicted", predicted)
             ));
         }
+        RetrievalMetrics retrievalMetrics = evaluateRetrieval(retrievalCases, results);
         for (EvalRunRequest.DialogCase c : dialogCases) {
             List<String> turns = c.turns() != null && !c.turns().isEmpty() ? c.turns() : List.of(c.question());
             List<Map<String, String>> history = new ArrayList<>();
@@ -100,6 +108,9 @@ public class EndToEndEvaluator {
         Map<String, Object> avgScores = new HashMap<>();
         avgScores.put("intent_accuracy", round(intentAccuracy));
         avgScores.put("macro_f1", round(macroF1(predictions, groundTruth)));
+        avgScores.put("retrieval_recall_at_k", round(retrievalMetrics.recallAtK()));
+        avgScores.put("retrieval_mrr", round(retrievalMetrics.mrr()));
+        avgScores.put("retrieval_hit_rate", round(retrievalMetrics.hitRate()));
         avgScores.put("dialog_overall", round(avgDialogOverall(results)));
         List<String> regressions = detectRegressions(avgScores);
         Map<String, Object> report = Map.of(
@@ -136,6 +147,89 @@ public class EndToEndEvaluator {
                 new EvalRunRequest.DialogCase("为什么这个月多扣了 50 块钱？", null, null, null),
                 new EvalRunRequest.DialogCase(null, List.of("你好，我想退款", "订单号是 #12345", "退款多久能到账？"), null, null)
         );
+    }
+
+    private List<EvalRunRequest.RetrievalCase> defaultRetrievalCases() {
+        return List.of(
+                new EvalRunRequest.RetrievalCase("退款审核后多久能回到原支付账户", "退款政策", "5-7", "", 4),
+                new EvalRunRequest.RetrievalCase("登录失败 401 是什么问题", "技术故障排查", "认证失败", "", 4),
+                new EvalRunRequest.RetrievalCase("满多少免运费", "配送说明", "99", "", 4)
+        );
+    }
+
+    private RetrievalMetrics evaluateRetrieval(List<EvalRunRequest.RetrievalCase> retrievalCases, List<Map<String, Object>> results) {
+        if (retrievalCases == null || retrievalCases.isEmpty()) {
+            return new RetrievalMetrics(0.0, 0.0, 0.0);
+        }
+        int hits = 0;
+        double reciprocalRankSum = 0.0;
+        for (EvalRunRequest.RetrievalCase c : retrievalCases) {
+            int topK = c.topK() == null ? properties.getRag().getTopK() : Math.max(1, c.topK());
+            List<SearchResult> searchResults = knowledgeBaseService.search(safe(c.query()), topK);
+            int rank = firstRelevantRank(c, searchResults);
+            boolean hit = rank > 0;
+            if (hit) {
+                hits++;
+                reciprocalRankSum += 1.0 / rank;
+            }
+            results.add(Map.of(
+                    "test_id", "retrieval_" + results.size(),
+                    "passed", hit,
+                    "scores", Map.of(
+                            "recall_at_k", hit ? 1.0 : 0.0,
+                            "reciprocal_rank", hit ? round(1.0 / rank) : 0.0,
+                            "top_score", searchResults.isEmpty() ? 0.0 : searchResults.getFirst().score()
+                    ),
+                    "metadata", Map.of(
+                            "query", safe(c.query()),
+                            "expected_title", safe(c.expectedTitle()),
+                            "expected_text", safe(c.expectedText()),
+                            "expected_source", safe(c.expectedSource()),
+                            "top_k", topK,
+                            "rank", rank,
+                            "top_results", searchResults.stream()
+                                    .map(result -> {
+                                        Map<String, Object> metadata = result.metadata() == null ? Map.of() : result.metadata();
+                                        return Map.of(
+                                                "id", result.id(),
+                                                "title", result.title(),
+                                                "score", result.score(),
+                                                "source", String.valueOf(metadata.getOrDefault("source", ""))
+                                        );
+                                    })
+                                    .toList()
+                    )
+            ));
+        }
+        double total = retrievalCases.size();
+        return new RetrievalMetrics(hits / total, reciprocalRankSum / total, hits / total);
+    }
+
+    private int firstRelevantRank(EvalRunRequest.RetrievalCase c, List<SearchResult> results) {
+        for (int i = 0; i < results.size(); i++) {
+            if (matches(c, results.get(i))) {
+                return i + 1;
+            }
+        }
+        return 0;
+    }
+
+    private boolean matches(EvalRunRequest.RetrievalCase c, SearchResult result) {
+        Map<String, Object> metadata = result.metadata() == null ? Map.of() : result.metadata();
+        return containsIfPresent(result.title(), c.expectedTitle())
+                && containsIfPresent(result.content(), c.expectedText())
+                && containsIfPresent(String.valueOf(metadata.getOrDefault("source", "")), c.expectedSource());
+    }
+
+    private boolean containsIfPresent(String actual, String expected) {
+        if (expected == null || expected.isBlank()) {
+            return true;
+        }
+        return actual != null && actual.toLowerCase(Locale.ROOT).contains(expected.toLowerCase(Locale.ROOT));
+    }
+
+    private String safe(String value) {
+        return value == null ? "" : value;
     }
 
     private double round(double value) {
@@ -228,5 +322,8 @@ public class EndToEndEvaluator {
             recs.add("所有指标均达标");
         }
         return recs;
+    }
+
+    private record RetrievalMetrics(double recallAtK, double mrr, double hitRate) {
     }
 }

@@ -1,6 +1,7 @@
 package com.echomind.memory;
 
 import com.echomind.config.EchoMindProperties;
+import com.echomind.knowledge.TextEmbeddingService;
 import com.echomind.llm.LlmGateway;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -31,14 +32,16 @@ public class MemoryManager {
     private final ObjectMapper objectMapper;
     private final EchoMindProperties properties;
     private final LlmGateway llmGateway;
+    private final TextEmbeddingService embeddingService;
     private final List<EpisodicEntry> episodicStore = new CopyOnWriteArrayList<>();
     private final Map<String, Map<String, Object>> profileStore = new ConcurrentHashMap<>();
 
-    public MemoryManager(StringRedisTemplate redisTemplate, ObjectMapper objectMapper, EchoMindProperties properties, LlmGateway llmGateway) {
+    public MemoryManager(StringRedisTemplate redisTemplate, ObjectMapper objectMapper, EchoMindProperties properties, LlmGateway llmGateway, TextEmbeddingService embeddingService) {
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
         this.properties = properties;
         this.llmGateway = llmGateway;
+        this.embeddingService = embeddingService;
     }
 
     @PostConstruct
@@ -131,7 +134,7 @@ public class MemoryManager {
         } catch (Exception ex) {
             summary = "对话包含 " + oldMessages.size() + " 条历史消息。";
         }
-        episodicStore.add(new EpisodicEntry(userId, conversationId, summary, text, Instant.now(), embed(summary)));
+        episodicStore.add(new EpisodicEntry(userId, conversationId, summary, text, Instant.now(), embeddingService.embed(summary)));
         persistMemory();
         String key = wmKey(userId, conversationId);
         try {
@@ -152,10 +155,10 @@ public class MemoryManager {
         if (query == null || query.isBlank()) {
             return List.of();
         }
-        double[] queryVec = embed(query);
+        double[] queryVec = embeddingService.embed(query);
         return episodicStore.stream()
                 .filter(e -> e.userId().equals(userId))
-                .sorted(Comparator.comparingDouble((EpisodicEntry e) -> cosine(queryVec, e.embedding())).reversed())
+                .sorted(Comparator.comparingDouble((EpisodicEntry e) -> embeddingService.cosine(queryVec, e.embedding())).reversed())
                 .limit(5)
                 .map(EpisodicEntry::summary)
                 .toList();
@@ -191,32 +194,6 @@ public class MemoryManager {
         return value == null ? "" : value;
     }
 
-    private double[] embed(String text) {
-        double[] vector = new double[256];
-        String normalized = text == null ? "" : text.toLowerCase();
-        for (int n = 1; n <= 3; n++) {
-            for (int i = 0; i + n <= normalized.length(); i++) {
-                String gram = normalized.substring(i, i + n);
-                int hash = gram.hashCode();
-                int idx = Math.floorMod(hash, vector.length);
-                vector[idx] += (hash & 1) == 0 ? 1.0 : -1.0;
-            }
-        }
-        return vector;
-    }
-
-    private double cosine(double[] a, double[] b) {
-        double dot = 0.0;
-        double na = 0.0;
-        double nb = 0.0;
-        for (int i = 0; i < a.length; i++) {
-            dot += a[i] * b[i];
-            na += a[i] * a[i];
-            nb += b[i] * b[i];
-        }
-        return na == 0 || nb == 0 ? 0.0 : dot / (Math.sqrt(na) * Math.sqrt(nb));
-    }
-
     private void loadPersistentMemory() {
         Path path = Path.of(properties.getStorage().getMemoryPath());
         if (!Files.exists(path)) {
@@ -233,7 +210,7 @@ public class MemoryManager {
                                 safe(entry.summary()),
                                 safe(entry.fullText()),
                                 entry.timestamp() == null ? Instant.now() : entry.timestamp(),
-                                embed(entry.summary())
+                                embeddingService.embed(entry.summary())
                         ));
                     }
                 });

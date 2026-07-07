@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
@@ -18,12 +19,9 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 @Service
@@ -36,12 +34,19 @@ public class KnowledgeBaseService {
     private final EchoMindProperties properties;
     private final VectorStore vectorStore;
     private final ObjectMapper objectMapper;
+    private final TextEmbeddingService embeddingService;
     private final List<KnowledgeDocument> documents = new CopyOnWriteArrayList<>();
 
     public KnowledgeBaseService(EchoMindProperties properties, ObjectProvider<VectorStore> vectorStoreProvider, ObjectMapper objectMapper) {
+        this(properties, vectorStoreProvider, objectMapper, TextEmbeddingService.hashOnly());
+    }
+
+    @Autowired
+    public KnowledgeBaseService(EchoMindProperties properties, ObjectProvider<VectorStore> vectorStoreProvider, ObjectMapper objectMapper, TextEmbeddingService embeddingService) {
         this.properties = properties;
         this.vectorStore = vectorStoreProvider.getIfAvailable();
         this.objectMapper = objectMapper;
+        this.embeddingService = embeddingService;
     }
 
     @PostConstruct
@@ -83,7 +88,7 @@ public class KnowledgeBaseService {
                         chunk.text(),
                         chunk.chunkIndex(),
                         metadata,
-                        embed(embeddingText(title, chunk))
+                        embeddingService.embed(embeddingText(title, chunk))
                 );
                 documents.removeIf(existing -> existing.id().equals(id));
                 documents.add(doc);
@@ -104,13 +109,7 @@ public class KnowledgeBaseService {
         Map<String, Double> bm25 = bm25Scores(query);
         Map<String, Double> vector = vectorScores(query);
         Map<String, Double> chroma = chromaScores(query, Math.max(topK, properties.getRag().getTopK()));
-        Map<String, Double> fused = new HashMap<>();
-        documents.forEach(doc -> {
-            double vectorScore = Math.max(vector.getOrDefault(doc.id(), 0.0), chroma.getOrDefault(doc.id(), 0.0));
-            double score = properties.getRag().getBm25Weight() * bm25.getOrDefault(doc.id(), 0.0)
-                    + properties.getRag().getVectorWeight() * vectorScore;
-            fused.put(doc.id(), score);
-        });
+        Map<String, Double> fused = fuseScores(bm25, vector, chroma);
         return documents.stream()
                 .sorted(Comparator.comparingDouble((KnowledgeDocument d) -> fused.getOrDefault(d.id(), 0.0)).reversed())
                 .limit(topK)
@@ -124,6 +123,40 @@ public class KnowledgeBaseService {
                 ))
                 .filter(result -> result.score() > 0.0)
                 .toList();
+    }
+
+    private Map<String, Double> fuseScores(Map<String, Double> bm25, Map<String, Double> vector, Map<String, Double> chroma) {
+        String strategy = properties.getRag().getFusionStrategy();
+        if ("rrf".equalsIgnoreCase(strategy)) {
+            return reciprocalRankFusion(bm25, vector, chroma);
+        }
+        Map<String, Double> fused = new HashMap<>();
+        documents.forEach(doc -> {
+            double vectorScore = Math.max(vector.getOrDefault(doc.id(), 0.0), chroma.getOrDefault(doc.id(), 0.0));
+            double score = properties.getRag().getBm25Weight() * bm25.getOrDefault(doc.id(), 0.0)
+                    + properties.getRag().getVectorWeight() * vectorScore;
+            fused.put(doc.id(), score);
+        });
+        return fused;
+    }
+
+    private Map<String, Double> reciprocalRankFusion(Map<String, Double> bm25, Map<String, Double> vector, Map<String, Double> chroma) {
+        double k = Math.max(1.0, properties.getRag().getRrfK());
+        Map<String, Double> fused = new HashMap<>();
+        addRrfScores(fused, bm25, k, properties.getRag().getBm25Weight());
+        addRrfScores(fused, vector, k, properties.getRag().getVectorWeight());
+        addRrfScores(fused, chroma, k, properties.getRag().getVectorWeight());
+        return normalize(fused);
+    }
+
+    private void addRrfScores(Map<String, Double> fused, Map<String, Double> scores, double k, double weight) {
+        List<Map.Entry<String, Double>> ranked = scores.entrySet().stream()
+                .filter(entry -> entry.getValue() != null && entry.getValue() > 0.0)
+                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                .toList();
+        for (int i = 0; i < ranked.size(); i++) {
+            fused.merge(ranked.get(i).getKey(), weight * (1.0 / (k + i + 1)), Double::sum);
+        }
     }
 
     public List<SearchResult> expandWithNeighbors(List<SearchResult> results, int window) {
@@ -322,7 +355,7 @@ public class KnowledgeBaseService {
             return;
         }
         try {
-            org.springframework.ai.document.Document springDoc = new org.springframework.ai.document.Document(doc.id(), doc.content(), doc.metadata());
+            org.springframework.ai.document.Document springDoc = new org.springframework.ai.document.Document(doc.id(), searchableText(doc), doc.metadata());
             vectorStore.add(List.of(springDoc));
         } catch (Exception ex) {
             log.debug("Spring AI VectorStore write skipped: {}", ex.getMessage());
@@ -349,7 +382,7 @@ public class KnowledgeBaseService {
                         item.content(),
                         item.chunkIndex(),
                         metadata,
-                        embed(title + "\n" + metadata.getOrDefault("heading_path", "") + "\n" + item.content())
+                        embeddingService.embed(title + "\n" + metadata.getOrDefault("heading_path", "") + "\n" + item.content())
                 );
                 documents.removeIf(existing -> existing.id().equals(doc.id()));
                 documents.add(doc);
@@ -377,23 +410,23 @@ public class KnowledgeBaseService {
     }
 
     private Map<String, Double> bm25Scores(String query) {
-        List<String> queryTerms = tokenize(query);
+        List<String> queryTerms = embeddingService.tokenize(query);
         Map<String, Double> scores = new HashMap<>();
         if (queryTerms.isEmpty() || documents.isEmpty()) {
             return scores;
         }
-        double avgDl = documents.stream().mapToInt(d -> tokenize(searchableText(d)).size()).average().orElse(1.0);
+        double avgDl = documents.stream().mapToInt(d -> embeddingService.tokenize(searchableText(d)).size()).average().orElse(1.0);
         double k1 = 1.5;
         double b = 0.75;
         for (KnowledgeDocument doc : documents) {
-            List<String> terms = tokenize(searchableText(doc));
+            List<String> terms = embeddingService.tokenize(searchableText(doc));
             double score = 0.0;
             for (String term : queryTerms) {
                 long tf = terms.stream().filter(term::equals).count();
                 if (tf == 0) {
                     continue;
                 }
-                long df = documents.stream().filter(d -> tokenize(searchableText(d)).contains(term)).count();
+                long df = documents.stream().filter(d -> embeddingService.tokenize(searchableText(d)).contains(term)).count();
                 double idf = Math.log(1 + (documents.size() - df + 0.5) / (df + 0.5));
                 double denom = tf + k1 * (1 - b + b * terms.size() / avgDl);
                 score += idf * (tf * (k1 + 1)) / denom;
@@ -404,10 +437,10 @@ public class KnowledgeBaseService {
     }
 
     private Map<String, Double> vectorScores(String query) {
-        double[] queryVec = embed(query);
+        double[] queryVec = embeddingService.embed(query);
         Map<String, Double> scores = new HashMap<>();
         for (KnowledgeDocument doc : documents) {
-            scores.put(doc.id(), Math.max(0.0, cosine(queryVec, doc.embedding())));
+            scores.put(doc.id(), Math.max(0.0, embeddingService.cosine(queryVec, doc.embedding())));
         }
         return normalize(scores);
     }
@@ -430,7 +463,8 @@ public class KnowledgeBaseService {
                 if (id == null || id.isBlank()) {
                     continue;
                 }
-                scores.put(id, Math.max(scores.getOrDefault(id, 0.0), 1.0 - (double) i / Math.max(1, results.size())));
+                double score = doc.getScore() == null ? 1.0 - (double) i / Math.max(1, results.size()) : doc.getScore();
+                scores.put(id, Math.max(scores.getOrDefault(id, 0.0), score));
             }
             return normalize(scores);
         } catch (Exception ex) {
@@ -447,48 +481,6 @@ public class KnowledgeBaseService {
         Map<String, Double> normalized = new HashMap<>();
         scores.forEach((id, score) -> normalized.put(id, score / max));
         return normalized;
-    }
-
-    private List<String> tokenize(String text) {
-        String normalized = text == null ? "" : text.toLowerCase(Locale.ROOT).replaceAll("[\\p{Punct}\\s]+", " ");
-        List<String> tokens = new ArrayList<>();
-        for (String part : normalized.split("\\s+")) {
-            if (!part.isBlank()) {
-                tokens.add(part);
-            }
-        }
-        for (int n = 2; n <= 3; n++) {
-            for (int i = 0; i + n <= normalized.length(); i++) {
-                String gram = normalized.substring(i, i + n).trim();
-                if (!gram.isBlank()) {
-                    tokens.add(gram);
-                }
-            }
-        }
-        return tokens;
-    }
-
-    private double[] embed(String text) {
-        double[] vector = new double[256];
-        Set<String> grams = new HashSet<>(tokenize(text));
-        for (String gram : grams) {
-            int hash = gram.hashCode();
-            int idx = Math.floorMod(hash, vector.length);
-            vector[idx] += (hash & 1) == 0 ? 1.0 : -1.0;
-        }
-        return vector;
-    }
-
-    private double cosine(double[] a, double[] b) {
-        double dot = 0.0;
-        double na = 0.0;
-        double nb = 0.0;
-        for (int i = 0; i < a.length; i++) {
-            dot += a[i] * b[i];
-            na += a[i] * a[i];
-            nb += b[i] * b[i];
-        }
-        return na == 0 || nb == 0 ? 0.0 : dot / (Math.sqrt(na) * Math.sqrt(nb));
     }
 
     private String md5(String value) {

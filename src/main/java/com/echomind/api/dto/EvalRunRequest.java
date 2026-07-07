@@ -8,6 +8,8 @@ import java.util.List;
 public record EvalRunRequest(
         @Schema(description = "意图识别评测用例")
         List<IntentCase> intentCases,
+        @Schema(description = "知识库检索评测用例")
+        List<RetrievalCase> retrievalCases,
         @Schema(description = "对话质量评测用例")
         List<DialogCase> dialogCases
 ) {
@@ -17,6 +19,21 @@ public record EvalRunRequest(
             String message,
             @Schema(description = "期望意图", example = "technical")
             String expectedIntent
+    ) {
+    }
+
+    @Schema(description = "知识库检索评测用例")
+    public record RetrievalCase(
+            @Schema(description = "检索查询", example = "退款多久到账")
+            String query,
+            @Schema(description = "期望命中的标题关键词", example = "退款")
+            String expectedTitle,
+            @Schema(description = "期望命中的内容关键词", example = "5-7 个工作日")
+            String expectedText,
+            @Schema(description = "期望命中的来源关键词", example = "policy.md")
+            String expectedSource,
+            @Schema(description = "检索 topK", example = "4")
+            Integer topK
     ) {
     }
 

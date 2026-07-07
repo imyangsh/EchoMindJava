@@ -59,9 +59,14 @@ echomind:
     top-k: ${RAG_TOP_K:4}
     bm25-weight: ${RAG_BM25_WEIGHT:0.45}
     vector-weight: ${RAG_VECTOR_WEIGHT:0.55}
+    fusion-strategy: ${RAG_FUSION_STRATEGY:rrf}
+    rrf-k: ${RAG_RRF_K:60}
     min-relevant-score: ${RAG_MIN_RELEVANT_SCORE:0.18}
     min-sources: ${RAG_MIN_SOURCES:1}
     context-window: ${RAG_CONTEXT_WINDOW:1}
+  intent:
+    samples-path: ${INTENT_SAMPLES_PATH:classpath:intent-samples.json}
+    semantic-threshold: ${INTENT_SEMANTIC_THRESHOLD:0.42}
   storage:
     data-dir: ${ECHOMIND_DATA_DIR:data/java}
     knowledge-path: ${KNOWLEDGE_STORE_PATH:${ECHOMIND_DATA_DIR:data/java}/knowledge-store.json}

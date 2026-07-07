@@ -13,6 +13,7 @@ public class EchoMindProperties {
     private final Memory memory = new Memory();
     private final Rag rag = new Rag();
     private final Storage storage = new Storage();
+    private final Intent intent = new Intent();
     private final Monitor monitor = new Monitor();
     private final Eval eval = new Eval();
     private final Skills skills = new Skills();
@@ -32,6 +33,10 @@ public class EchoMindProperties {
 
     public Storage getStorage() {
         return storage;
+    }
+
+    public Intent getIntent() {
+        return intent;
     }
 
     public Monitor getMonitor() {
@@ -99,6 +104,8 @@ public class EchoMindProperties {
         private double minRelevantScore = 0.18;
         private int minSources = 1;
         private int contextWindow = 1;
+        private String fusionStrategy = "rrf";
+        private int rrfK = 60;
 
         public int getTopK() {
             return topK;
@@ -147,6 +154,22 @@ public class EchoMindProperties {
         public void setContextWindow(int contextWindow) {
             this.contextWindow = contextWindow;
         }
+
+        public String getFusionStrategy() {
+            return fusionStrategy;
+        }
+
+        public void setFusionStrategy(String fusionStrategy) {
+            this.fusionStrategy = fusionStrategy == null || fusionStrategy.isBlank() ? "weighted" : fusionStrategy;
+        }
+
+        public int getRrfK() {
+            return rrfK;
+        }
+
+        public void setRrfK(int rrfK) {
+            this.rrfK = rrfK;
+        }
     }
 
     public static class Storage {
@@ -176,6 +199,27 @@ public class EchoMindProperties {
 
         public void setMemoryPath(String memoryPath) {
             this.memoryPath = memoryPath;
+        }
+    }
+
+    public static class Intent {
+        private String samplesPath = "classpath:intent-samples.json";
+        private double semanticThreshold = 0.42;
+
+        public String getSamplesPath() {
+            return samplesPath;
+        }
+
+        public void setSamplesPath(String samplesPath) {
+            this.samplesPath = samplesPath == null || samplesPath.isBlank() ? "classpath:intent-samples.json" : samplesPath;
+        }
+
+        public double getSemanticThreshold() {
+            return semanticThreshold;
+        }
+
+        public void setSemanticThreshold(double semanticThreshold) {
+            this.semanticThreshold = semanticThreshold;
         }
     }
 
