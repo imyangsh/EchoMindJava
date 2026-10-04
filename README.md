@@ -23,7 +23,9 @@ EchoMind Java 是一个基于 Spring Boot 的智能客服 Agent 项目。它围�
 |---|---|
 | Runtime | Java 21 |
 | Web | Spring Boot 3.5, Spring MVC |
+| Security | Spring Security（API Key 鉴权） |
 | LLM | Spring AI Anthropic, Spring AI DeepSeek |
+| Embedding | 阿里云百炼 `text-embedding-v4`（与 ChatModel 独立配置） |
 | RAG | BM25, Spring AI EmbeddingModel, local hash vector fallback, Spring AI Chroma VectorStore, RRF/weighted fusion, LLM rerank |
 | Memory | Redis + JSON store |
 | Tools | AgentToolRegistry, MCP stdio/http/sse |
@@ -111,6 +113,13 @@ Copy-Item .env.example .env
 SPRING_PROFILES_ACTIVE=anthropic
 ANTHROPIC_API_KEY=your_key
 ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
+
+# EmbeddingModel 独立使用阿里云百炼
+DASHSCOPE_API_KEY=your_dashscope_key
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com
+DASHSCOPE_EMBEDDING_MODEL=text-embedding-v4
+DASHSCOPE_EMBEDDING_DIMENSIONS=1024
+CHROMA_COLLECTION=echomind_knowledge_dashscope_te4_1024_v1
 ```
 
 切换 DeepSeek：
@@ -119,6 +128,10 @@ ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
 SPRING_PROFILES_ACTIVE=deepseek
 DEEPSEEK_API_KEY=your_key
 DEEPSEEK_MODEL=deepseek-chat
+
+# 切换 ChatModel 不影响独立的百炼 EmbeddingModel
+DASHSCOPE_API_KEY=your_dashscope_key
+DASHSCOPE_EMBEDDING_MODEL=text-embedding-v4
 ```
 
 如果只想本地启动调试，可以保留：
@@ -127,7 +140,8 @@ DEEPSEEK_MODEL=deepseek-chat
 LLM_FALLBACK_ENABLED=true
 ```
 
-缺少真实 API Key 时，项目会尽量使用本地 fallback 回复，避免启动阶段直接失败。
+`LLM_FALLBACK_ENABLED` 只控制聊天调用的本地降级。百炼 EmbeddingModel 在应用启动时装配，
+因此必须提供有效的 `DASHSCOPE_API_KEY`；Key 只通过环境变量传入，不要写入 Git。
 
 ### 4. 启动应用
 
@@ -188,6 +202,11 @@ docker compose down
 
 默认端口：`8080`
 
+> 鉴权说明：`/health`、`/chat`、`/search` 与 Swagger 文档公开访问；
+> 其余管理接口（`/knowledge/**`、`/skills/**`、`/mcp/**`、`/monitor`、`/metrics`、`/eval/**`）
+> 需要请求头 `X-API-Key: <ECHOMIND_API_KEY>`。未配置 `ECHOMIND_API_KEY` 时，
+> 管理接口一律拒绝访问（fail-closed）。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查 |
@@ -205,7 +224,8 @@ docker compose down
 | GET | `/monitor` | 监控摘要 |
 | GET | `/metrics` | Prometheus 文本指标 |
 | GET | `/actuator/prometheus` | Actuator Prometheus 指标 |
-| POST | `/eval/run` | 运行评测 |
+| POST | `/eval/run` | 提交评测任务（异步，返回 job_id） |
+| GET | `/eval/status/{jobId}` | 查询评测任务状态与报告 |
 | GET | `/docs` | Swagger UI |
 | GET | `/v3/api-docs` | OpenAPI JSON |
 
@@ -254,6 +274,7 @@ curl -X POST "http://localhost:8080/search?query=退款多久能到账&topK=3"
 
 ```bash
 curl -X POST http://localhost:8080/knowledge/add \
+  -H "X-API-Key: $ECHOMIND_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "documents": [
@@ -269,7 +290,10 @@ curl -X POST http://localhost:8080/knowledge/add \
 
 ```bash
 curl -X POST http://localhost:8080/knowledge/upload \
+  -H "X-API-Key: $ECHOMIND_API_KEY" \
   -F "file=@docs.md"
+
+> 上传仅支持 `.md` / `.txt` / `.json`，单文件不超过 10MB。
 ```
 
 ## RAG 和知识库
@@ -278,30 +302,43 @@ curl -X POST http://localhost:8080/knowledge/upload \
 
 ```text
 文档
-  -> heading / paragraph aware splitter
-  -> metadata: source, heading_path, paragraph_start, paragraph_end
+  -> 章节边界 + 句子切分 + token 上限 / overlap
+  -> metadata: document_id, document_version, source, heading_path, paragraph_start, paragraph_end
   -> previous_chunk_id / next_chunk_id
-  -> JSON 持久化
-  -> Spring AI VectorStore 写入（可用时）
+  -> 批量 Embedding + 真倒排 BM25 索引 + 独立 hash 索引
+  -> JSON 持久化正文、向量空间、模型与内容指纹
+  -> 批量 Spring AI VectorStore 写入（可用时）
 ```
 
 查询链路：
 
 ```text
 用户问题
-  -> LLM 查询改写
-  -> 多子查询并行召回
-  -> BM25 关键词得分
-  -> Spring AI EmbeddingModel 语义向量（可用时）
-  -> ChromaDB / Spring AI VectorStore 语义召回（可用时）
-  -> 本地 hash vector 兜底召回（无 EmbeddingModel 时）
-  -> RRF 或加权融合
-  -> LLM rerank
-  -> 命中 chunk 前后窗口扩展
+  -> 带历史、知识库版本及配置指纹的最终结果缓存
+  -> 原问题直接召回：BM25 + Chroma，Chroma 不可用时使用本地同空间向量
+  -> 弱召回或历史指代时按需 LLM 改写 / 消解
+  -> 有数量上限的多子查询并行召回
+  -> 跨查询 RRF 合并 + 对原问题 / 消解后的问题重新计算证据相关性
+  -> 候选池独立于 finalK，按 token 预算 LLM rerank，异常保留融合排序
+  -> 命中 chunk 前后窗口扩展、重叠内容合并、上下文 token 预算
   -> 返回 knowledge_sources / context_sources
 ```
 
-文本向量由 `TextEmbeddingService` 统一管理：如果 Spring 容器里存在 `EmbeddingModel`，优先使用真实 embedding；否则自动退回 256 维 hash embedding，保证本地开发和测试不依赖外部 embedding 服务。
+文本向量由 `TextEmbeddingService` 统一管理。当前 Spring 容器中的 `EmbeddingModel` 是独立配置的
+阿里云百炼 `text-embedding-v4`（默认 1024 维），同时供意图识别、本地语义向量和 ChromaDB 使用；外部调用异常时，
+本地相似度计算仍可退回独立的 1024 维 hash 索引。真实向量与 hash 即使维度相同也不混用；
+外部模型恢复后补建缺失的真实向量。`score` 是证据分，`retrieval_score` 是融合排序分，
+`rerank_rank` 是重排位置，不能把融合分直接用于证据充分性阈值。
+
+Embedding 模型或输出维度发生变化时，必须切换到新的 `CHROMA_COLLECTION`，不能把不同模型生成的
+向量混放在同一个 collection 中。JSON 中模型与内容指纹匹配的本地向量可直接复用；
+不匹配或旧格式没有向量时批量重建。改变 Chroma collection 后应重新导入知识，确保新集合有完整数据。
+
+同来源、同标题对应稳定的 `document_id`，重新导入会替换该文档的旧 chunk，并更新知识库版本使缓存失效。
+正常结果采用有界 LRU 缓存；失败和降级结果不缓存。重复并发请求合并执行。
+改写、召回、评分和重排共享 `timeout-ms` 总预算，改写和重排另有阶段预算。
+部分失败保留有效证据并标记 `degraded=true`，全部失败返回 `success=false`；`/search` 同时返回缓存与耗时信息。
+网络请求由 `AI_CONNECT_TIMEOUT` / `AI_READ_TIMEOUT` 限制，取消 Java Future 不代表底层 HTTP 已立即停止。
 
 相关配置：
 
@@ -309,14 +346,38 @@ curl -X POST http://localhost:8080/knowledge/upload \
 echomind:
   rag:
     top-k: ${RAG_TOP_K:4}
+    candidate-k: ${RAG_CANDIDATE_K:20}
+    rerank-k: ${RAG_RERANK_K:20}
     bm25-weight: ${RAG_BM25_WEIGHT:0.45}
     vector-weight: ${RAG_VECTOR_WEIGHT:0.55}
     fusion-strategy: ${RAG_FUSION_STRATEGY:rrf}
     rrf-k: ${RAG_RRF_K:60}
     min-relevant-score: ${RAG_MIN_RELEVANT_SCORE:0.18}
+    hash-min-relevant-score: ${RAG_HASH_MIN_RELEVANT_SCORE:0.18}
     min-sources: ${RAG_MIN_SOURCES:1}
     context-window: ${RAG_CONTEXT_WINDOW:1}
+    max-chunk-tokens: ${RAG_MAX_CHUNK_TOKENS:512}
+    overlap-tokens: ${RAG_OVERLAP_TOKENS:64}
+    context-max-tokens: ${RAG_CONTEXT_MAX_TOKENS:3000}
+    rewrite-enabled: ${RAG_REWRITE_ENABLED:true}
+    max-rewrite-queries: ${RAG_MAX_REWRITE_QUERIES:3}
+    rewrite-trigger-score: ${RAG_REWRITE_TRIGGER_SCORE:0.35}
+    timeout-ms: ${RAG_TIMEOUT_MS:30000}
+    rewrite-timeout-ms: ${RAG_REWRITE_TIMEOUT_MS:3000}
+    rerank-timeout-ms: ${RAG_RERANK_TIMEOUT_MS:5000}
+    rerank-max-input-tokens: ${RAG_RERANK_MAX_INPUT_TOKENS:4000}
+    cache-max-entries: ${RAG_CACHE_MAX_ENTRIES:2000}
+    cache-ttl-seconds: ${RAG_CACHE_TTL_SECONDS:300}
 ```
+
+token 预算统一使用 CL100K 编码计数，作为分块和提示词的工程预算；不同模型的实际 tokenizer 仍需核对。
+旧 JSON 保持兼容加载，不自动重切已有 chunk；旧文档重新导入后才应用新的章节和 token 分块策略。
+候选数量和真实/hash 阈值是可调初值，需要用业务标注集校准。`min-sources` 统计不同文档，不把同一文档的多个 chunk 当成多份来源。
+
+检索评测同时报告底层召回和生产链路（绕过缓存）的 Recall@K、MRR、nDCG、无答案误接纳率及 P95。
+`retrieval_cases` 可提供 `relevant_chunk_ids` 或 `relevant_document_ids` 集合作为 Recall 分母；旧关键词用例仅统计 Hit/MRR，Recall/nDCG 为 `null`。
+支持 `no_answer` 和 `history`。评测基线首次创建后保留，显式传 `update_baseline=true` 才替换。
+模型调用与阶段耗时计数是共享统计的增量，并发流量可能影响数值；报告不估算缺少数据的 token 或费用。
 
 当知识证据不足时：
 
@@ -328,21 +389,40 @@ echomind:
 
 ## 意图识别
 
-意图识别由 `IntentRecognizer` 负责，当前采用组合策略：
+意图识别由 `IntentRecognizer` 负责。三个通道各自产出证据，再走**决策级联**定夺（不再做数值加权投票）：
 
 ```text
 用户消息
-  -> LLM 意图判断
-  -> intent-samples.json 样本语义匹配
-  -> 关键词规则兜底
-  -> 置信度校准和投票
+  -> LLM 通道（chatStructured，要求 JSON 输出；区分不可用、超时、JSON/字段错误和未知标签）
+  -> 语义通道（按来源分开的样本向量索引 + top1/margin）
+  -> 模式通道（可配置关键词表 + 泛化词过滤 + 命中区间去重 + 句段内否定过滤）
+
+决策级联（自上而下，命中即返回）：
+  1. LLM 明确返回 other 且达到 llm-direct-threshold -> 拒识，领域词不能覆盖域外结论
+  2. LLM 非 other 且达到 llm-direct-threshold       -> 采信 LLM
+  3. LLM 低置信/不可用且语义强证据                   -> 采信语义；强 other 证据拒识
+  4. 模式通道命中 >= pattern-min-hits 个独立内容词   -> 采信模式
+  5. 模式单内容词得到语义佐证、压过弱闲聊相似度，或足以解释整条消息 -> 采信模式
+  6. LLM 低置信/不可用且语义弱证据足够               -> 采信语义
+  7. LLM 非 other 且达到 min-confidence             -> 保留 LLM 结果并标记低置信
+  8. 其余情况                                       -> 拒识并澄清
 ```
 
-语义匹配使用 `TextEmbeddingService`。有可用 `EmbeddingModel` 时使用真实 embedding；没有时使用本地 hash embedding 兜底。样本文件默认位于：
+`/chat` 会回传 `intent_confidence`、`intent_source`（`llm`/`semantic`/`pattern`/`abstain`）、`intent_entities` 与 `intent_abstained`，便于线上排查误判。三个通道的证据同时会注入 Agent 提示词的 `[Intent]` 段，并在评测报告里逐条落库。单内容词已有语义方向佐证时，不要求相似度达到独立路由的下限；明确业务词也优先于弱 `greeting`/`feedback` 相似度，高置信 LLM 和强语义证据仍优先。
+
+语义匹配使用 `TextEmbeddingService`。向量携带来源、模型标识和维度，意图索引仅比较同一空间的向量。真实 embedding 与 1024 维 hash 各有完整独立索引，即使维度相同也不能混用。查询降级时直接使用本地 hash 索引；样本调用中途失败时，不发布部分真实、部分 hash 的混合索引。临时 hash 结果不进入真实模型缓存，恢复后会重新请求并补全真实索引。
+
+**相似度不是正确率，两种后端的分数分布也不同。** `semantic-threshold`、`weak-score` 和 margin 应用独立验证集按实际后端标定。默认参数主要用于本地 hash 降级路径，不代表真实模型上线后的最优阈值。
+
+识别缓存采用线程安全 LRU，默认最多 2000 条、有效期 300 秒。缓存键包含用户、会话、原始消息、完整模型提示词和样本版本；原始消息保留实体大小写。`cache-history-turns` 同时控制提示词与缓存使用的历史消息条数，默认 4 条（user/assistant 各算一条）。LLM 故障或真实 embedding 临时降级的结果不缓存，避免恢复后继续使用旧结论。
+
+样本文件默认位于：
 
 ```text
 src/main/resources/intent-samples.json
 ```
+
+文件内 `_comment` 键是标签判据文档，加载时会被跳过；未知标签不会混入 `other`。`other` 样本同时用于 LLM few-shot 与语义索引，默认兜底样本也保留域外表达。
 
 相关配置：
 
@@ -350,44 +430,92 @@ src/main/resources/intent-samples.json
 echomind:
   intent:
     samples-path: ${INTENT_SAMPLES_PATH:classpath:intent-samples.json}
-    semantic-threshold: ${INTENT_SEMANTIC_THRESHOLD:0.42}
+    semantic-enabled: ${INTENT_SEMANTIC_ENABLED:true}
+    semantic-threshold: ${INTENT_SEMANTIC_THRESHOLD:0.45}
+    semantic-margin: ${INTENT_SEMANTIC_MARGIN:0.05}
+    semantic-top-k: ${INTENT_SEMANTIC_TOP_K:3}
+    llm-direct-threshold: ${INTENT_LLM_DIRECT_THRESHOLD:0.6}
+    min-confidence: ${INTENT_MIN_CONFIDENCE:0.5}
+    pattern-min-hits: ${INTENT_PATTERN_MIN_HITS:2}
+    cache-history-turns: ${INTENT_CACHE_HISTORY_TURNS:4}
+    cache-max-entries: ${INTENT_CACHE_MAX_ENTRIES:2000}
+    cache-ttl-seconds: ${INTENT_CACHE_TTL_SECONDS:300}
 ```
+
+`/eval/run` 默认包含 58 条意图用例，涵盖复述、域外、否定和跨领域表达。回归测试检查它们与样本库不存在 NFKC 归一化、去标点和空白后的重复。评测走 `recognizeUncached` 绕过缓存。
+
+报告包含主意图 accuracy、macro-F1、每类 precision/recall、混淆矩阵、接受覆盖率、域外错误接纳率、域内拒识率与识别延迟 P95。传入 `expected_domains` 的用例还会评测完整意图集合的 precision、recall 和 exact-match，报告提供实际参与此项评测的用例数。自定义意图用例支持可选 `history`；原有只传 `message`、`expected_intent` 的请求保持兼容。
+
+### 多意图与协作路由
+
+`IntentResult` 除主意图外还带 `secondaryIntents`：有效规则命中的其他领域，以及达到强语义阈值且至少有两个样本支持的候选。`IntentRecognizer.domainIntents()` 始终保留主意图并合并这些次意图，拒识结果的领域集合为空。
+
+`AgentOrchestrator` 的协作判断**只使用这一份领域证据**，不再维护自己的关键词表：`domainIntents` 里每个领域经 `routing` 映射到 AgentType，命中多个即走并行协作。两条约束：
+
+- 只有带有效内容词的规则命中才算领域证据。“自动续费/续费”在同一处只计一次；“不用退款”“账单没问题”等被否定的领域也不会靠整句语义相似度重新进入协作。
+- 上游预先指定意图时，主意图、次意图和领域证据仍会合并；已有领域证据不能覆盖主意图。上游传入拒识标记时直接返回澄清话术。
+
+多意图通过 `also_touches` 保留原始识别证据；编排器先生成有序 `DispatchPlan`，给各专业 Agent 分配独立领域任务。CRITICAL 请求统一由升级策略参与计划，单领域和多领域路径一致。回复按领域整合，并合并完全相同的共同建议；未完成领域明确展示，返回 `SUCCESS / PARTIAL / DEGRADED / FAILED / TIMEOUT / REJECTED / CANCELLED / CLARIFICATION` 状态与分支诊断。
+
+单 Agent、并行分支、工具和降级共用请求截止时间。Agent 与阻塞操作使用独立有界线程池，饱和时显式拒绝，超时取消实际任务并停止后续调用。只读 MCP 查询在同一请求内共享；已有工具结果供降级、汇总和校验复用。最终回答最多修订一次，未通过校验的草稿不写入可信长期记忆。
+
+`/chat` 与对话评测共用 `ChatPipeline`。评测隔离会话和记忆写入，并可用 `compare_single_agent: true` 比较同一用例的单 Agent 与协作结果。完整配置、接口字段、评测示例和验证边界见 [多 Agent 实现说明](docs/multi-agent-implementation.md)。
 
 ## Skills
 
-Skills 位于 `skills/` 目录，每个 Skill 使用 `SKILL.md`：
+Skills 默认从 `ECHOMIND_SKILLS_DIR` 指定目录（默认 `skills/`）发现 `SKILL.md`。内置规则拆为公共底线、四类角色基础 SOP 和十类场景：
 
-```text
-skills/
-  billing_support/SKILL.md
-  general_customer_service/SKILL.md
-  technical_support/SKILL.md
-```
+- `common_guardrails`：所有 Agent 的隐私、事实和承诺边界。
+- `general_customer_service`、`technical_support`、`billing_support`、`escalation_support`：按角色常驻，不依赖本轮关键词。
+- 退款申请/到账、发票、订阅、支付争议、账户、登录、接口、超时、配置部署：先按 Agent 和任务意图过滤，再匹配场景关键词。
 
-Skill front matter 示例：
+场景 Skill 的 YAML front matter 示例：
 
 ```markdown
 ---
-name: 技术支持处理规范
-description: 技术排障流程
-keywords: 报错,500,error
-agents: technical
+id: api-diagnostics
+name: 接口错误诊断
+description: API 认证授权和服务端错误排查
+agents: [technical, general]
+intents: [technical]
+keywords: 接口,API,500,401,403
 enabled: true
+always_apply: false
+priority: 160
 ---
 
-# 技术支持处理规范
+# 接口错误诊断
 
-请先收集错误码、发生时间、设备信息和复现步骤。
+## 禁止事项
+不得索取完整密钥，不得仅凭状态码断定根因。
+
+## 升级条件
+生产持续故障或需要后台权限时转二线技术。
+
+## 排查步骤
+收集脱敏错误码、发生时间、request_id 和最小复现。
 ```
 
-运行时接口：
+元数据使用严格 YAML 校验，支持标准列表及旧的逗号格式；未知字段、无效类型、重复键/ID、缺少结束符或空正文会拒绝整次加载，保留上一成功版本。默认不注册普通 `.md/.txt/.json` 文件，`references/`、`scripts/`、`assets/` 及隐藏目录跳过；旧文件格式须显式开启 `echomind.skills.legacy-files-enabled`。
+
+每次请求固定同一 Skills 快照，生成、校验和修复共享实际选中的业务规则。短追问可参考近期用户历史；新场景关键词或明确切换话题会重新选择，跨领域分支仍分别过滤。规则优先按常驻、优先级、相关性和稳定 ID 排序；总预算包含前言、标题、描述、分隔符及省略提示，按完整二级章节保留，优先保护禁止事项和升级条件。`/chat` 返回版本及分支选择追踪，便于检查命中来源、跳过原因与预算省略。
+
+运行时接口需要 `X-API-Key`：
 
 ```bash
-curl http://localhost:8080/skills
-curl -X POST http://localhost:8080/skills/reload
+curl -H "X-API-Key: $ECHOMIND_API_KEY" http://localhost:8080/skills
+curl -X POST -H "X-API-Key: $ECHOMIND_API_KEY" http://localhost:8080/skills/reload
 ```
 
+reload 响应中的 `applied` 表示本次是否生效；`version` 和 `skills` 是当前有效快照，`errors` 描述本次加载错误。已有规则时空目录默认拒绝替换，确需清空可显式开启 `allow-empty-reload`。字段、默认限制、匹配和编写要求见 [Skills 文档](skills/README.md)。
+
 ## MCP 工具调用
+
+MCP 默认关闭，且策略为 **fail-closed**：
+
+- `allowed-tools` 为空 = 该 server 的全部工具拒绝调用（必须显式列出白名单）
+- Agent 自动调用要求工具同时出现在 `read-only-tools` 中；该列表为空时自动调用一律拒绝
+- 通配符支持任意位置的 `*` 与 `?`（如 `*secret*`）
 
 MCP 默认关闭：
 
@@ -465,14 +593,15 @@ AgentToolService
 查看 MCP 状态：
 
 ```bash
-curl http://localhost:8080/mcp
-curl http://localhost:8080/mcp/tools
+curl -H "X-API-Key: $ECHOMIND_API_KEY" http://localhost:8080/mcp
+curl -H "X-API-Key: $ECHOMIND_API_KEY" http://localhost:8080/mcp/tools
 ```
 
 手动调用 MCP 工具：
 
 ```bash
 curl -X POST http://localhost:8080/mcp/tools/remote/search/call \
+  -H "X-API-Key: $ECHOMIND_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"arguments":{"query":"hello"}}'
 ```
@@ -502,16 +631,21 @@ echomind:
 监控接口：
 
 ```bash
-curl http://localhost:8080/monitor
-curl http://localhost:8080/metrics
+curl -H "X-API-Key: $ECHOMIND_API_KEY" http://localhost:8080/monitor
+curl -H "X-API-Key: $ECHOMIND_API_KEY" http://localhost:8080/metrics
 ```
 
 评测接口：
 
 ```bash
+# 提交评测（异步，立即返回 job_id）
 curl -X POST http://localhost:8080/eval/run \
+  -H "X-API-Key: $ECHOMIND_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{}'
+
+# 轮询结果
+curl -H "X-API-Key: $ECHOMIND_API_KEY" http://localhost:8080/eval/status/<job_id>
 ```
 
 当前包含：
@@ -582,23 +716,42 @@ src/main/java/com/echomind
 | `SPRING_PROFILES_ACTIVE` | `anthropic` | 模型 profile |
 | `ANTHROPIC_API_KEY` | 空 | Anthropic API Key |
 | `DEEPSEEK_API_KEY` | 空 | DeepSeek API Key |
+| `DASHSCOPE_API_KEY` | 无（必填） | 阿里云百炼 API Key，仅供 EmbeddingModel 使用 |
+| `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com` | 百炼北京地域 API 根地址；可换成业务空间专属域名 |
+| `DASHSCOPE_EMBEDDINGS_PATH` | `/compatible-mode/v1/embeddings` | 百炼 OpenAI 兼容 Embedding 路径 |
+| `DASHSCOPE_EMBEDDING_MODEL` | `text-embedding-v4` | 独立 Embedding 模型 |
+| `DASHSCOPE_EMBEDDING_DIMENSIONS` | `1024` | 向量维度；改变后必须使用新 collection |
 | `LLM_FALLBACK_ENABLED` | `true` | LLM 失败时是否使用本地降级回复 |
 | `REDIS_HOST` | `localhost` | Redis host |
-| `REDIS_PORT` | `6379` | Redis port |
+| `REDIS_PORT` | `6380` | Redis port（宿主机默认映射） |
 | `REDIS_PASSWORD` | `echomind123` | Redis password |
 | `CHROMA_HOST` | `http://localhost` | Chroma host |
-| `CHROMA_PORT` | `8001` | Chroma port |
+| `CHROMA_PORT` | `8002` | Chroma port（宿主机默认映射） |
+| `CHROMA_COLLECTION` | `echomind_knowledge_dashscope_te4_1024_v1` | Chroma collection；更换向量模型或维度时需改名 |
 | `ECHOMIND_DATA_DIR` | `data/java` | 数据目录 |
 | `RAG_FUSION_STRATEGY` | `rrf` | RAG 融合策略，支持 `rrf` / `weighted` |
 | `RAG_RRF_K` | `60` | RRF 排名平滑参数 |
 | `INTENT_SAMPLES_PATH` | `classpath:intent-samples.json` | 意图样本文件 |
-| `INTENT_SEMANTIC_THRESHOLD` | `0.42` | 意图语义匹配兜底阈值 |
+| `INTENT_SEMANTIC_ENABLED` | `true` | 是否启用语义（样本向量）通道 |
+| `INTENT_SEMANTIC_THRESHOLD` | `0.45` | 语义通道独立定夺意图的相似度阈值（需按 embedding 后端标定） |
+| `INTENT_SEMANTIC_MARGIN` | `0.05` | 语义独立定夺所需的 top1-top2 间距 |
+| `INTENT_SEMANTIC_TOP_K` | `3` | 语义通道按标签聚合的窗口大小 |
+| `INTENT_LLM_DIRECT_THRESHOLD` | `0.6` | LLM 置信度达到该值即直接采信 |
+| `INTENT_MIN_CONFIDENCE` | `0.5` | 低于该置信度视为 LLM 弃权，交由其他通道补位 |
+| `INTENT_PATTERN_MIN_HITS` | `2` | 模式通道独立定夺所需的最少内容词命中数 |
+| `INTENT_CACHE_HISTORY_TURNS` | `4` | 提示词与缓存共同使用的历史消息条数 |
+| `INTENT_CACHE_MAX_ENTRIES` | `2000` | 识别结果缓存容量（LRU） |
+| `INTENT_CACHE_TTL_SECONDS` | `300` | 识别缓存有效期，0 表示关闭 |
 | `MCP_ENABLED` | `false` | 是否启用 MCP |
+| `ECHOMIND_API_KEY` | 空 | 管理接口 API Key（X-API-Key 头）；为空时管理接口拒绝访问 |
+| `ECHOMIND_CORS_ORIGINS` | 空 | CORS 允许来源（逗号分隔），为空不开放跨域 |
 | `MCP_AUTO_TOOL_ENABLED` | `true` | Agent 是否自动选择 MCP 工具 |
 
 ## 当前限制
 
-- ChromaDB 召回依赖 Spring AI `VectorStore` bean。若当前模型 profile 没有可用 EmbeddingModel，系统会自动回退到本地 BM25 + hash vector。
+- ChromaDB 召回依赖阿里云百炼 Embedding API；短时调用失败时本地检索仍可降级到 BM25 + hash vector，但 Chroma 写入或查询会跳过。
+- hash 向量主要反映词面与 n-gram 重合，弱证据路径仍可能误接纳带领域词的域外表达；局部否定规则也不能覆盖反讽、引用和所有复杂语法。泛化质量需要真实 LLM/embedding 与独立线上标注数据验证。
+- 意图评测默认集为 58 条人工标注用例，规模仍偏小；本地降级评测和测试通过率都不能代替真实模型的线上准确率。
 - MCP HTTP / SSE 当前按 JSON-RPC POST 兼容常见服务端；更复杂的长连接 session 管理可继续增强。
 - 当前尚未提供 CLI 模式。
 - 监控侧还可以继续增强更细粒度的异常检测、趋势分析和告警降噪。

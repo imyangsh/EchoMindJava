@@ -1,9 +1,17 @@
 server:
   port: ${SERVER_PORT:8080}
+  error:
+    # 错误响应不回显异常细节，统一由 GlobalExceptionHandler 处理
+    include-stacktrace: never
+    include-message: never
 
 spring:
   application:
     name: echomind-java
+  # 本地直跑（IDEA/mvnw，工作目录为项目根）时自动读取 .env；容器内无该文件会自动跳过。
+  # 注意：进程环境里已存在的同名变量优先级更高，会覆盖 .env 中的值
+  config:
+    import: optional:file:.env[.properties]
   profiles:
     active: ${SPRING_PROFILES_ACTIVE:anthropic}
   jackson:
@@ -11,13 +19,48 @@ spring:
   mvc:
     pathmatch:
       matching-strategy: ANT_PATH_MATCHER
+  # 自动配置的 RestClient/RestTemplate（含 Spring AI 的 LLM 调用）默认读超时是无限，
+  # 上游网关挂起会把工作线程永久占住，必须显式设超时
+  http:
+    client:
+      connect-timeout: ${AI_CONNECT_TIMEOUT:3s}
+      read-timeout: ${AI_READ_TIMEOUT:30s}
+  servlet:
+    multipart:
+      # 与 /knowledge/upload 的 10MB 业务上限对齐；不配置时 Boot 默认 1MB，
+      # 会让控制器里的大小检查永远不可达
+      max-file-size: 10MB
+      max-request-size: 12MB
   data:
     redis:
+      # 默认值面向宿主机直跑（IDEA 本地调试），连接 docker compose 映射到宿主机的
+      # 127.0.0.1:6380；容器内运行时由 compose 显式注入 REDIS_HOST=redis/REDIS_PORT=6379 覆盖
       host: ${REDIS_HOST:localhost}
-      port: ${REDIS_PORT:6379}
+      port: ${REDIS_PORT:6380}
       password: ${REDIS_PASSWORD:echomind123}
       timeout: 2s
   ai:
+    # ChatModel 由 anthropic/deepseek profile 选择；EmbeddingModel 独立使用阿里云百炼。
+    model:
+      # 复用 OpenAI starter 调用百炼的 OpenAI 兼容 Embedding API；starter 还包含
+      # chat/image/audio/moderation 自动配置，因此全部显式关闭。chat 会由下方 profile 覆盖。
+      chat: none
+      embedding: openai
+      image: none
+      moderation: none
+      audio:
+        speech: none
+        transcription: none
+    openai:
+      embedding:
+        api-key: ${DASHSCOPE_API_KEY}
+        # 默认使用百炼北京地域公共端点；生产环境可通过 DASHSCOPE_BASE_URL
+        # 换成业务空间专属域名：https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com
+        base-url: ${DASHSCOPE_BASE_URL:https://dashscope.aliyuncs.com}
+        embeddings-path: ${DASHSCOPE_EMBEDDINGS_PATH:/compatible-mode/v1/embeddings}
+        options:
+          model: ${DASHSCOPE_EMBEDDING_MODEL:text-embedding-v4}
+          dimensions: ${DASHSCOPE_EMBEDDING_DIMENSIONS:1024}
     anthropic:
       api-key: ${ANTHROPIC_API_KEY:${LLM_STARTUP_API_KEY:echomind-local-placeholder}}
       base-url: ${ANTHROPIC_BASE_URL:https://api.anthropic.com}
@@ -29,9 +72,16 @@ spring:
     vectorstore:
       chroma:
         client:
+          # 同上：默认连 docker compose 映射到宿主机的 8002；
+          # 容器内由 compose 注入 CHROMA_HOST=http://chromadb/CHROMA_PORT=8000 覆盖
           host: ${CHROMA_HOST:http://localhost}
-          port: ${CHROMA_PORT:8001}
-        collection-name: ${CHROMA_COLLECTION:echomind_knowledge}
+          port: ${CHROMA_PORT:8002}
+        # collection 名包含 embedding 模型版本，避免和旧模型生成的不同维度向量混用。
+        collection-name: ${CHROMA_COLLECTION:echomind_knowledge_dashscope_te4_1024_v1}
+        # Spring AI 1.1.0 默认租户/数据库为 SpringAiTenant/SpringAiDatabase，本项目实际数据
+        # 位于 default_tenant/default_database；不对齐会查不到集合导致 vectorStore 启动失败
+        tenant-name: ${CHROMA_TENANT:default_tenant}
+        database-name: ${CHROMA_DATABASE:default_database}
         initialize-schema: true
 
 management:
@@ -49,24 +99,80 @@ springdoc:
     path: /v3/api-docs
 
 echomind:
+  security:
+    # 管理接口（/knowledge/**、/mcp/**、/eval/**、/skills/**、/monitor、/metrics）的
+    # API Key，请求时放在 X-API-Key 头。为空时管理接口一律返回 401/403（fail-closed）。
+    api-key: ${ECHOMIND_API_KEY:}
+    # CORS 允许来源，逗号分隔；为空表示不开放跨域
+    cors-allowed-origins: ${ECHOMIND_CORS_ORIGINS:}
   llm:
     fallback-enabled: ${LLM_FALLBACK_ENABLED:true}
+  agent:
+    request-timeout-ms: ${AGENT_REQUEST_TIMEOUT_MS:120000}
+    branch-timeout-ms: ${AGENT_BRANCH_TIMEOUT_MS:60000}
+    verification-timeout-ms: ${AGENT_VERIFICATION_TIMEOUT_MS:8000}
+    max-repair-attempts: ${AGENT_MAX_REPAIR_ATTEMPTS:1}
+    context-max-chars: ${AGENT_CONTEXT_MAX_CHARS:18000}
+    core-pool-size: ${AGENT_CORE_POOL_SIZE:4}
+    max-pool-size: ${AGENT_MAX_POOL_SIZE:16}
+    queue-capacity: ${AGENT_QUEUE_CAPACITY:100}
+    operation-core-pool-size: ${AGENT_OPERATION_CORE_POOL_SIZE:8}
+    operation-max-pool-size: ${AGENT_OPERATION_MAX_POOL_SIZE:32}
+    operation-queue-capacity: ${AGENT_OPERATION_QUEUE_CAPACITY:100}
+    # Additional per-role narrowing of the existing MCP read-only policy.
+    # An omitted role preserves that policy; an explicitly empty role denies all tools.
+    tool-allowlist: {}
   memory:
     ttl-seconds: ${MEMORY_TTL_SECONDS:86400}
     working-max: ${MEMORY_WORKING_MAX:20}
     compress-at: ${MEMORY_COMPRESS_AT:15}
   rag:
     top-k: ${RAG_TOP_K:4}
+    candidate-k: ${RAG_CANDIDATE_K:20}
+    rerank-k: ${RAG_RERANK_K:20}
     bm25-weight: ${RAG_BM25_WEIGHT:0.45}
     vector-weight: ${RAG_VECTOR_WEIGHT:0.55}
     fusion-strategy: ${RAG_FUSION_STRATEGY:rrf}
     rrf-k: ${RAG_RRF_K:60}
     min-relevant-score: ${RAG_MIN_RELEVANT_SCORE:0.18}
+    hash-min-relevant-score: ${RAG_HASH_MIN_RELEVANT_SCORE:0.18}
     min-sources: ${RAG_MIN_SOURCES:1}
     context-window: ${RAG_CONTEXT_WINDOW:1}
+    max-chunk-tokens: ${RAG_MAX_CHUNK_TOKENS:512}
+    overlap-tokens: ${RAG_OVERLAP_TOKENS:64}
+    context-max-tokens: ${RAG_CONTEXT_MAX_TOKENS:3000}
+    rewrite-enabled: ${RAG_REWRITE_ENABLED:true}
+    max-rewrite-queries: ${RAG_MAX_REWRITE_QUERIES:3}
+    rewrite-min-query-chars: ${RAG_REWRITE_MIN_QUERY_CHARS:6}
+    rewrite-trigger-score: ${RAG_REWRITE_TRIGGER_SCORE:0.35}
+    timeout-ms: ${RAG_TIMEOUT_MS:30000}
+    rewrite-timeout-ms: ${RAG_REWRITE_TIMEOUT_MS:3000}
+    rerank-timeout-ms: ${RAG_RERANK_TIMEOUT_MS:5000}
+    rerank-max-input-tokens: ${RAG_RERANK_MAX_INPUT_TOKENS:4000}
+    cache-max-entries: ${RAG_CACHE_MAX_ENTRIES:2000}
+    cache-ttl-seconds: ${RAG_CACHE_TTL_SECONDS:300}
   intent:
     samples-path: ${INTENT_SAMPLES_PATH:classpath:intent-samples.json}
-    semantic-threshold: ${INTENT_SEMANTIC_THRESHOLD:0.42}
+    # 语义（样本向量）通道总开关。生产保持 true；关闭后意图完全由 LLM 与模式通道决定，
+    # 用于隔离 embedding 后端故障或单独验证模式通道行为。
+    semantic-enabled: ${INTENT_SEMANTIC_ENABLED:true}
+    # 语义通道独立定夺意图的最低相似度。必须按 embedding 后端标定：hash 兜底向量与真实
+    # embedding 的相似度分布完全不同（hash 空间下复述句普遍 < 0.40，只有逐字命中才能到 1.0）。
+    # 当前默认值按 hash 兜底向量实测标定；接真实 embedding 后应重新标定。
+    semantic-threshold: ${INTENT_SEMANTIC_THRESHOLD:0.45}
+    # top1 与 top2 的最小间距，防止"两类分数几乎相同"时被随机挑一个
+    semantic-margin: ${INTENT_SEMANTIC_MARGIN:0.05}
+    # 按标签保留的最近样本数；最高相似度决定标签，窗口内支持数用于平票裁决
+    semantic-top-k: ${INTENT_SEMANTIC_TOP_K:3}
+    # LLM 自报置信度达到该值即直接采信；低于 min-confidence 视为弃权，交给语义/模式补位
+    llm-direct-threshold: ${INTENT_LLM_DIRECT_THRESHOLD:0.6}
+    min-confidence: ${INTENT_MIN_CONFIDENCE:0.5}
+    # 模式通道独立定夺所需的最少命中关键词数（旧实现里模式通道权重 0.10，永远无法独立成立）
+    pattern-min-hits: ${INTENT_PATTERN_MIN_HITS:2}
+    # LLM 与缓存共同使用的历史消息条数，user/assistant 各算一条
+    cache-history-turns: ${INTENT_CACHE_HISTORY_TURNS:4}
+    cache-max-entries: ${INTENT_CACHE_MAX_ENTRIES:2000}
+    cache-ttl-seconds: ${INTENT_CACHE_TTL_SECONDS:300}
   storage:
     data-dir: ${ECHOMIND_DATA_DIR:data/java}
     knowledge-path: ${KNOWLEDGE_STORE_PATH:${ECHOMIND_DATA_DIR:data/java}/knowledge-store.json}
@@ -81,6 +187,11 @@ echomind:
     root-dir: ${ECHOMIND_SKILLS_DIR:skills}
     max-prompt-chars: ${ECHOMIND_SKILLS_MAX_PROMPT_CHARS:5000}
     max-skill-chars: ${ECHOMIND_SKILLS_MAX_SKILL_CHARS:3200}
+    legacy-files-enabled: ${ECHOMIND_SKILLS_LEGACY_FILES_ENABLED:false}
+    max-file-bytes: ${ECHOMIND_SKILLS_MAX_FILE_BYTES:262144}
+    max-files: ${ECHOMIND_SKILLS_MAX_FILES:128}
+    max-depth: ${ECHOMIND_SKILLS_MAX_DEPTH:8}
+    allow-empty-reload: ${ECHOMIND_SKILLS_ALLOW_EMPTY_RELOAD:false}
   mcp:
     enabled: ${MCP_ENABLED:false}
     auto-tool-enabled: ${MCP_AUTO_TOOL_ENABLED:true}
@@ -99,6 +210,8 @@ spring:
     exclude:
       - org.springframework.ai.model.anthropic.autoconfigure.AnthropicChatAutoConfiguration
   ai:
+    model:
+      chat: deepseek
     deepseek:
       api-key: ${DEEPSEEK_API_KEY:${LLM_STARTUP_API_KEY:echomind-local-placeholder}}
       base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
@@ -116,3 +229,6 @@ spring:
   autoconfigure:
     exclude:
       - org.springframework.ai.model.deepseek.autoconfigure.DeepSeekChatAutoConfiguration
+  ai:
+    model:
+      chat: anthropic

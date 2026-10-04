@@ -17,11 +17,25 @@ import java.util.Map;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 class AgentToolRegistryTest {
 
     @TempDir
     Path tempDir;
+
+    @Test
+    void internalKnowledgeToolValidatesSchemaBeforeInvokingRetrieval() {
+        ObjectMapper objectMapper = new ObjectMapper();
+        KnowledgeToolManager knowledge = mock(KnowledgeToolManager.class);
+        AgentToolRegistry registry = new AgentToolRegistry(null, knowledge, objectMapper);
+        AgentToolRegistry.ToolExecution result = registry.execute("internal", "knowledge_search",
+                Map.of("query", 123, "hidden_argument", "bad"));
+        assertThat(result.success()).isFalse();
+        assertThat(result.error()).contains("query must be string", "hidden_argument is not allowed");
+        verifyNoInteractions(knowledge);
+    }
 
     @Test
     void exposesKnowledgeSearchAsInternalAgentTool() {

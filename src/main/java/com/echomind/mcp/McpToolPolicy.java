@@ -4,7 +4,18 @@ import com.echomind.config.EchoMindProperties;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Pattern;
 
+/**
+ * MCP 工具调用策略，整体为 fail-closed（默认拒绝）：
+ * <ul>
+ *   <li>allowed-tools 为空 = 全部拒绝（旧实现为空 = 全放行，接入含写操作的
+ *       server 而忘记配置白名单时，LLM 一次幻觉即可自动调用破坏性工具）；</li>
+ *   <li>Agent 自动调用必须显式出现在 read-only-tools 中，该列表为空时自动调用一律拒绝；</li>
+ *   <li>通配符支持任意位置的 {@code *} 与 {@code ?}（旧实现只支持前缀 {@code *}，
+ *       运维按 glob 直觉写 {@code *secret*} 会静默失效）。</li>
+ * </ul>
+ */
 public class McpToolPolicy {
 
     private final EchoMindProperties.Server server;
@@ -17,7 +28,7 @@ public class McpToolPolicy {
         return allowedByList(toolName)
                 && !matches(server.getBlockedTools(), toolName)
                 && !matches(server.getDangerousTools(), toolName)
-                && (server.getReadOnlyTools().isEmpty() || matches(server.getReadOnlyTools(), toolName));
+                && matches(server.getReadOnlyTools(), toolName);
     }
 
     public ToolPolicyStatus status(String toolName) {
@@ -36,23 +47,41 @@ public class McpToolPolicy {
         if (matches(server.getDangerousTools(), toolName)) {
             return PolicyCheck.deny("dangerous tool blocked by policy: " + toolName);
         }
-        if (automatic && !server.getReadOnlyTools().isEmpty() && !matches(server.getReadOnlyTools(), toolName)) {
+        if (automatic && !matches(server.getReadOnlyTools(), toolName)) {
             return PolicyCheck.deny("automatic call requires read-only tool: " + toolName);
         }
         return PolicyCheck.allow();
     }
 
     private boolean allowedByList(String toolName) {
-        return server.getAllowedTools().isEmpty() || matches(server.getAllowedTools(), toolName);
+        //fail-closed：白名单为空即全部拒绝
+        return !server.getAllowedTools().isEmpty() && matches(server.getAllowedTools(), toolName);
     }
 
     private boolean matches(List<String> patterns, String toolName) {
         String normalized = normalize(toolName);
         return patterns.stream()
                 .map(this::normalize)
-                .anyMatch(pattern -> pattern.equals("*")
-                        || pattern.equals(normalized)
-                        || (pattern.endsWith("*") && normalized.startsWith(pattern.substring(0, pattern.length() - 1))));
+                .anyMatch(pattern -> matchesPattern(pattern, normalized));
+    }
+
+    private boolean matchesPattern(String pattern, String value) {
+        if (pattern.equals("*")) {
+            return true;
+        }
+        if (!pattern.contains("*") && !pattern.contains("?")) {
+            return pattern.equals(value);
+        }
+        //完整 glob：* 匹配任意串、? 匹配单字符，其余字符全部按字面量转义
+        StringBuilder regex = new StringBuilder();
+        for (char c : pattern.toCharArray()) {
+            switch (c) {
+                case '*' -> regex.append(".*");
+                case '?' -> regex.append('.');
+                default -> regex.append(Pattern.quote(String.valueOf(c)));
+            }
+        }
+        return value.matches(regex.toString());
     }
 
     private String normalize(String value) {

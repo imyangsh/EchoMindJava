@@ -18,7 +18,8 @@ public class AgentConfig {
         return Map.of(
                 AgentType.GENERAL, List.of(new GeneralAgent(llmGateway, toolService)),
                 AgentType.TECHNICAL, List.of(new TechnicalAgent(llmGateway, toolService)),
-                AgentType.BILLING, List.of(new BillingAgent(llmGateway, toolService))
+                AgentType.BILLING, List.of(new BillingAgent(llmGateway, toolService)),
+                AgentType.ESCALATION, List.of(new EscalationAgent(llmGateway, toolService))
         );
     }
 }

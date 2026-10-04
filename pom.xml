@@ -8,14 +8,12 @@
     <artifactId>echomind-java</artifactId>
     <version>0.1.0</version>
     <name>EchoMind Java</name>
-    <description>Spring Boot, Spring AI and LangChain4j implementation of EchoMind.</description>
+    <description>Spring Boot and Spring AI implementation of EchoMind.</description>
 
     <properties>
         <java.version>21</java.version>
         <spring-boot.version>3.5.0</spring-boot.version>
         <spring-ai.version>1.1.0</spring-ai.version>
-        <langchain4j.version>1.12.2</langchain4j.version>
-        <langchain4j.spring.version>1.12.2-beta22</langchain4j.spring.version>
         <springdoc.version>2.8.17</springdoc.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
@@ -55,6 +53,10 @@
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
         <dependency>
@@ -72,17 +74,11 @@
         </dependency>
         <dependency>
             <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-model-openai</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-vector-store-chroma</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>dev.langchain4j</groupId>
-            <artifactId>langchain4j</artifactId>
-            <version>${langchain4j.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>dev.langchain4j</groupId>
-            <artifactId>langchain4j-spring-boot-starter</artifactId>
-            <version>${langchain4j.spring.version}</version>
         </dependency>
         <dependency>
             <groupId>io.micrometer</groupId>
@@ -91,6 +87,10 @@
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.yaml</groupId>
+            <artifactId>snakeyaml</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

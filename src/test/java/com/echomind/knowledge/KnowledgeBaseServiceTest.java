@@ -23,6 +23,8 @@ class KnowledgeBaseServiceTest {
     void chunksKeepHeadingSourceParagraphAndNeighborMetadata() {
         EchoMindProperties properties = new EchoMindProperties();
         properties.getStorage().setKnowledgePath(tempDir.resolve("knowledge-store.json").toString());
+        properties.getRag().setMaxChunkTokens(100);
+        properties.getRag().setOverlapTokens(20);
         KnowledgeBaseService service = new KnowledgeBaseService(properties, noVectorStore(), new ObjectMapper());
 
         int added = service.addDocuments(List.of(Map.of(
@@ -52,7 +54,7 @@ class KnowledgeBaseServiceTest {
         SearchResult top = results.getFirst();
         assertThat(top.metadata())
                 .containsEntry("source", "support.md")
-                .containsEntry("splitter", "heading-paragraph-v1");
+                .containsEntry("splitter", "heading-token-v2");
         assertThat(top.metadata().get("heading_path").toString()).contains("Support Handbook > Technical");
         assertThat(top.metadata()).containsKeys("paragraph_start", "paragraph_end", "previous_chunk_id", "next_chunk_id");
         assertThat(results.stream().map(SearchResult::metadata).map(metadata -> metadata.get("next_chunk_id").toString()))

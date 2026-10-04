@@ -9,6 +9,12 @@ scrape_configs:
   - job_name: echomind-java-app
     metrics_path: /metrics
     scrape_interval: 10s
+    # 应用启用鉴权后，/metrics 需要 X-API-Key 请求头。
+    # 把 ECHOMIND_API_KEY 的值写入下面的 credentials（或改用 credentials_file 挂载密钥文件）。
+    # authorization 机制不支持自定义头，这里用 Prometheus 的 http header 配置：
+    # http_headers:
+    #   X-API-Key:
+    #     values: ["<your ECHOMIND_API_KEY>"]
     static_configs:
       - targets:
           - echomind-java:8080

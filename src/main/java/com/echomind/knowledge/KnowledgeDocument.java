@@ -8,6 +8,6 @@ public record KnowledgeDocument(
         String content,
         int chunkIndex,
         Map<String, Object> metadata,
-        double[] embedding
+        TextEmbeddingService.EmbeddingVector embedding
 ) {
 }

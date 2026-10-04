@@ -1,5 +1,6 @@
 package com.echomind.evaluation;
 
+import com.echomind.common.JsonSlices;
 import com.echomind.llm.LlmGateway;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -30,9 +31,11 @@ public class LLMJudge {
                 """.formatted(question, response, context == null ? "" : context);
         try {
             String raw = llmGateway.chat("", prompt, 0.0, 256);
-            int start = raw.indexOf('{');
-            int end = raw.lastIndexOf('}');
-            Map<String, Object> data = objectMapper.readValue(raw.substring(start, end + 1), new TypeReference<>() {
+            String json = JsonSlices.sliceObject(raw);
+            if (json == null) {
+                throw new IllegalStateException("judge response contains no JSON object");
+            }
+            Map<String, Object> data = objectMapper.readValue(json, new TypeReference<>() {
             });
             return new QualityScores(
                     asDouble(data.get("relevance"), 0.5),

@@ -20,6 +20,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -29,6 +30,11 @@ import java.util.concurrent.atomic.AtomicLong;
 public class StdioMcpClient implements McpClient {
 
     private static final Logger log = LoggerFactory.getLogger(StdioMcpClient.class);
+    /** 帧头累计上限：超过即判定协议错误（例如把 json-lines 服务器误配成 content-length），避免无限缓冲直至 OOM。 */
+    private static final int MAX_HEADER_BYTES = 8 * 1024;
+    /** 单帧消息体上限，防止恶意/异常的超大 Content-Length 直接打爆堆。 */
+    private static final int MAX_BODY_BYTES = 16 * 1024 * 1024;
+    private static final Set<String> KNOWN_STDIO_FORMATS = Set.of("content-length", "json-lines", "jsonl");
 
     private final String serverName;
     private final EchoMindProperties.Server serverConfig;
@@ -38,8 +44,8 @@ public class StdioMcpClient implements McpClient {
     private final AtomicLong ids = new AtomicLong(1);
     private final Map<Long, CompletableFuture<JsonNode>> pending = new ConcurrentHashMap<>();
 
-    private Process process;
-    private OutputStream stdin;
+    private volatile Process process;
+    private volatile OutputStream stdin;
     private Thread stdoutThread;
     private Thread stderrThread;
     private volatile boolean initialized;
@@ -69,6 +75,14 @@ public class StdioMcpClient implements McpClient {
         if (serverConfig.getCommand() == null || serverConfig.getCommand().isBlank()) {
             throw new IllegalStateException("MCP server command is blank: " + serverName);
         }
+        if (serverConfig.getStdioFormat() != null && !KNOWN_STDIO_FORMATS.contains(stdioFormat())) {
+            //拼写错误的格式值（如 jsonlines）会静默退化为 content-length，
+            //读线程永远等不到帧头、所有请求超时——启动时就把问题暴露出来。
+            log.warn("Unknown stdio-format '{}' for MCP server {}; falling back to content-length framing. Known values: {}",
+                    serverConfig.getStdioFormat(), serverName, KNOWN_STDIO_FORMATS);
+        }
+        //重启前清理上一次的进程与管道，避免 FD 泄漏
+        closeProcessQuietly();
         try {
             List<String> command = new ArrayList<>();
             command.add(serverConfig.getCommand());
@@ -78,12 +92,20 @@ public class StdioMcpClient implements McpClient {
                 builder.directory(Path.of(serverConfig.getWorkingDir()).toFile());
             }
             builder.environment().putAll(serverConfig.getEnv());
-            process = builder.start();
-            stdin = process.getOutputStream();
-            stdoutThread = new Thread(this::readStdout, "mcp-" + serverName + "-stdout");
+            Process started = builder.start();
+            process = started;
+            stdin = started.getOutputStream();
+            //子进程意外退出时立刻 fail 掉全部挂起请求，而不是让调用方硬等满超时
+            started.onExit().thenRun(() -> {
+                if (process == started) {
+                    initialized = false;
+                    failPending("MCP server process exited: " + serverName);
+                }
+            });
+            stdoutThread = new Thread(() -> readStdout(started), "mcp-" + serverName + "-stdout");
             stdoutThread.setDaemon(true);
             stdoutThread.start();
-            stderrThread = new Thread(this::readStderr, "mcp-" + serverName + "-stderr");
+            stderrThread = new Thread(() -> readStderr(started), "mcp-" + serverName + "-stderr");
             stderrThread.setDaemon(true);
             stderrThread.start();
             initialize();
@@ -128,13 +150,14 @@ public class StdioMcpClient implements McpClient {
     }
 
     public Map<String, Object> summary() {
+        Process current = process;
         return Map.of(
                 "name", serverName,
                 "enabled", serverConfig.isEnabled(),
                 "command", serverConfig.getCommand() == null ? "" : serverConfig.getCommand(),
                 "args", serverConfig.getArgs(),
                 "stdio_format", stdioFormat(),
-                "running", process != null && process.isAlive(),
+                "running", current != null && current.isAlive(),
                 "initialized", initialized
         );
     }
@@ -160,15 +183,20 @@ public class StdioMcpClient implements McpClient {
         request.set("params", params == null ? objectMapper.createObjectNode() : params);
         CompletableFuture<JsonNode> future = new CompletableFuture<>();
         pending.put(id, future);
-        writeMessage(request);
+        //writeMessage 也放进 try：写入失败（如 Broken pipe）时同样要清理 pending，
+        //否则该 future 永久滞留在 map 中造成泄漏。
         try {
+            writeMessage(request);
             return future.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (TimeoutException ex) {
-            pending.remove(id);
             throw new IllegalStateException("MCP request timed out: " + serverName + "/" + method);
         } catch (Exception ex) {
-            pending.remove(id);
+            if (ex instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             throw new IllegalStateException("MCP request failed: " + serverName + "/" + method + ": " + ex.getMessage(), ex);
+        } finally {
+            pending.remove(id);
         }
     }
 
@@ -196,29 +224,38 @@ public class StdioMcpClient implements McpClient {
         }
     }
 
-    private void readStdout() {
-        if (contentLengthFormat()) {
-            readContentLengthStdout();
-        } else {
-            readJsonLineStdout();
+    private void readStdout(Process source) {
+        try {
+            if (contentLengthFormat()) {
+                readContentLengthStdout(source);
+            } else {
+                readJsonLineStdout(source);
+            }
+        } finally {
+            //读线程退出（EOF、半帧、协议错误、异常）意味着连接已不可用：
+            //统一 fail 掉全部挂起请求，避免调用方硬等满 30s 超时。
+            if (process == source) {
+                initialized = false;
+            }
+            failPending("MCP stdout closed: " + serverName);
         }
     }
 
-    private void readJsonLineStdout() {
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+    private void readJsonLineStdout(Process source) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(source.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 handleMessage(line);
             }
         } catch (Exception ex) {
-            if (process != null && process.isAlive()) {
+            if (source.isAlive()) {
                 log.warn("MCP stdout reader failed for {}: {}", serverName, ex.getMessage());
             }
         }
     }
 
-    private void readContentLengthStdout() {
-        try (InputStream input = process.getInputStream()) {
+    private void readContentLengthStdout(Process source) {
+        try (InputStream input = source.getInputStream()) {
             while (true) {
                 byte[] headerBytes = readHeaderBytes(input);
                 if (headerBytes.length == 0) {
@@ -229,6 +266,10 @@ public class StdioMcpClient implements McpClient {
                     log.debug("Ignoring MCP stdout frame without Content-Length from {}: {}", serverName, new String(headerBytes, StandardCharsets.US_ASCII));
                     continue;
                 }
+                if (contentLength > MAX_BODY_BYTES) {
+                    log.error("MCP frame from {} exceeds max body size ({} > {}); closing reader", serverName, contentLength, MAX_BODY_BYTES);
+                    return;
+                }
                 byte[] body = input.readNBytes(contentLength);
                 if (body.length < contentLength) {
                     return;
@@ -236,7 +277,7 @@ public class StdioMcpClient implements McpClient {
                 handleMessage(new String(body, StandardCharsets.UTF_8));
             }
         } catch (Exception ex) {
-            if (process != null && process.isAlive()) {
+            if (source.isAlive()) {
                 log.warn("MCP stdout reader failed for {}: {}", serverName, ex.getMessage());
             }
         }
@@ -247,6 +288,10 @@ public class StdioMcpClient implements McpClient {
         int value;
         while ((value = input.read()) != -1) {
             buffer.write(value);
+            if (buffer.size() > MAX_HEADER_BYTES) {
+                throw new IllegalStateException("MCP frame header exceeds " + MAX_HEADER_BYTES
+                        + " bytes; check stdio-format configuration for server " + serverName);
+            }
             byte[] bytes = buffer.toByteArray();
             if (endsWith(bytes, new byte[]{'\r', '\n', '\r', '\n'})) {
                 return Arrays.copyOf(bytes, bytes.length - 4);
@@ -290,14 +335,14 @@ public class StdioMcpClient implements McpClient {
         return true;
     }
 
-    private void readStderr() {
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8))) {
+    private void readStderr(Process source) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(source.getErrorStream(), StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 log.debug("MCP stderr [{}]: {}", serverName, line);
             }
         } catch (Exception ex) {
-            if (process != null && process.isAlive()) {
+            if (source.isAlive()) {
                 log.debug("MCP stderr reader failed for {}: {}", serverName, ex.getMessage());
             }
         }
@@ -306,11 +351,19 @@ public class StdioMcpClient implements McpClient {
     private void handleMessage(String line) {
         try {
             JsonNode message = objectMapper.readTree(line);
-            JsonNode idNode = message.get("id");
-            if (idNode == null || !idNode.canConvertToLong()) {
+            //服务端发起的请求/通知（带 method 字段）不是我方请求的响应，
+            //不能拿它的 id 去完成 pending future——双方 id 空间独立，
+            //撞号会让 tools/call 拿到 null 结果并被当成成功。
+            if (message.has("method")) {
+                handleServerMessage(message);
                 return;
             }
-            CompletableFuture<JsonNode> future = pending.remove(idNode.asLong());
+            JsonNode idNode = message.get("id");
+            Long id = extractId(idNode);
+            if (id == null) {
+                return;
+            }
+            CompletableFuture<JsonNode> future = pending.remove(id);
             if (future == null) {
                 return;
             }
@@ -324,6 +377,53 @@ public class StdioMcpClient implements McpClient {
         } catch (Exception ex) {
             log.debug("Ignoring non-JSON MCP stdout line from {}: {}", serverName, line);
         }
+    }
+
+    /** 兼容把数字 id 回显成字符串（如 "1"）的服务端实现。 */
+    private Long extractId(JsonNode idNode) {
+        if (idNode == null || idNode.isNull()) {
+            return null;
+        }
+        if (idNode.canConvertToLong()) {
+            return idNode.asLong();
+        }
+        if (idNode.isTextual()) {
+            try {
+                return Long.parseLong(idNode.asText().trim());
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private void handleServerMessage(JsonNode message) {
+        String method = message.path("method").asText("");
+        JsonNode idNode = message.get("id");
+        if (idNode == null || idNode.isNull()) {
+            //通知：记录后忽略
+            log.debug("MCP notification from {}: {}", serverName, method);
+            return;
+        }
+        //服务端请求（roots/list、sampling/createMessage 等）本客户端未实现，按 JSON-RPC 规范回 -32601
+        log.debug("Rejecting unsupported MCP server request from {}: {}", serverName, method);
+        try {
+            ObjectNode response = objectMapper.createObjectNode();
+            response.put("jsonrpc", "2.0");
+            response.set("id", idNode.deepCopy());
+            ObjectNode error = objectMapper.createObjectNode();
+            error.put("code", -32601);
+            error.put("message", "Method not supported by echomind-java client: " + method);
+            response.set("error", error);
+            writeMessage(response);
+        } catch (Exception ex) {
+            log.debug("Failed to respond to MCP server request {}: {}", method, ex.getMessage());
+        }
+    }
+
+    private void failPending(String reason) {
+        pending.values().forEach(future -> future.completeExceptionally(new IllegalStateException(reason)));
+        pending.clear();
     }
 
     private long timeoutMs() {
@@ -344,22 +444,29 @@ public class StdioMcpClient implements McpClient {
     @Override
     public synchronized void close() {
         initialized = false;
-        pending.values().forEach(future -> future.completeExceptionally(new IllegalStateException("MCP client closed")));
-        pending.clear();
+        failPending("MCP client closed");
+        closeProcessQuietly();
+    }
+
+    private void closeProcessQuietly() {
         try {
             if (stdin != null) {
                 stdin.close();
             }
         } catch (Exception ignored) {
         }
-        if (process != null && process.isAlive()) {
-            process.destroy();
+        Process current = process;
+        if (current != null && current.isAlive()) {
+            current.destroy();
             try {
-                if (!process.waitFor(2, TimeUnit.SECONDS)) {
-                    process.destroyForcibly();
+                if (!current.waitFor(2, TimeUnit.SECONDS)) {
+                    current.destroyForcibly();
                 }
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                current.destroyForcibly();
             } catch (Exception ignored) {
-                process.destroyForcibly();
+                current.destroyForcibly();
             }
         }
         process = null;

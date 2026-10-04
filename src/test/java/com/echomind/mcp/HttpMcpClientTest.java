@@ -63,6 +63,8 @@ class HttpMcpClientTest {
         remote.setTransport(transport);
         remote.setUrl(url);
         remote.setAllowedTools(List.of("echo"));
+        //fail-closed 策略下，自动调用与 Agent 可见性要求工具显式声明为只读
+        remote.setReadOnlyTools(List.of("echo"));
         properties.getMcp().setServers(Map.of("remote", remote));
         return new McpClientManager(properties, objectMapper);
     }

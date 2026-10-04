@@ -14,6 +14,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.EnumMap;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -26,7 +27,8 @@ public class IntentSampleStore {
     private final EchoMindProperties properties;
     private final ObjectMapper objectMapper;
     private final ResourceLoader resourceLoader;
-    private Map<IntentCategory, List<String>> samples = fallbackSamples();
+    private volatile Map<IntentCategory, List<String>> samples = fallbackSamples();
+    private volatile long revision;
 
     public IntentSampleStore(EchoMindProperties properties, ObjectMapper objectMapper, ResourceLoader resourceLoader) {
         this.properties = properties;
@@ -35,29 +37,55 @@ public class IntentSampleStore {
     }
 
     @PostConstruct
-    public void load() {
+    public synchronized void load() {
         String path = properties.getIntent().getSamplesPath();
         try (InputStream inputStream = open(path)) {
             Map<String, List<String>> raw = objectMapper.readValue(inputStream, new TypeReference<>() {
             });
             Map<IntentCategory, List<String>> loaded = new EnumMap<>(IntentCategory.class);
             raw.forEach((key, values) -> {
+                // 以下划线开头的键是文档/元数据（如 "_comment"），不是意图类别。
+                // 旧实现把无法识别的键静默按 OTHER 处理，会让注释块冒充成域外样本。
+                if (key == null || key.startsWith("_") || values == null) {
+                    return;
+                }
                 IntentCategory intent = parseIntent(key);
-                if (intent != IntentCategory.OTHER && values != null && !values.isEmpty()) {
-                    loaded.put(intent, values.stream().filter(value -> value != null && !value.isBlank()).toList());
+                if (intent == null) {
+                    log.warn("Ignoring unknown intent sample label: {}", key);
+                    return;
+                }
+                List<String> cleaned = values.stream()
+                        .filter(value -> value != null && !value.isBlank())
+                        .map(String::trim)
+                        .distinct()
+                        .toList();
+                // 保留 OTHER：域外样本参与 few-shot 与语义拒识。
+                // 旧实现把 OTHER 过滤掉，模型与向量索引都学不到"什么该判为无法识别"。
+                if (!cleaned.isEmpty()) {
+                    loaded.put(intent, cleaned);
                 }
             });
-            if (!loaded.isEmpty()) {
-                samples = loaded;
+            if (loaded.isEmpty()) {
+                log.warn("Intent samples at {} contained no usable entries, keeping fallback samples", path);
+            } else {
+                samples = Collections.unmodifiableMap(loaded);
+                revision++;
+                log.info("Intent samples loaded from {}: {} intents, {} samples",
+                        path, loaded.size(), loaded.values().stream().mapToInt(List::size).sum());
             }
         } catch (Exception ex) {
             log.warn("Failed to load intent samples from {}, using fallback samples: {}", path, ex.getMessage());
             samples = fallbackSamples();
+            revision++;
         }
     }
 
     public Map<IntentCategory, List<String>> samples() {
         return samples;
+    }
+
+    public long revision() {
+        return revision;
     }
 
     private InputStream open(String path) throws Exception {
@@ -73,9 +101,9 @@ public class IntentSampleStore {
 
     private IntentCategory parseIntent(String value) {
         try {
-            return IntentCategory.valueOf(value.toUpperCase(Locale.ROOT));
+            return IntentCategory.valueOf(value.trim().toUpperCase(Locale.ROOT));
         } catch (Exception ex) {
-            return IntentCategory.OTHER;
+            return null;
         }
     }
 
@@ -90,6 +118,7 @@ public class IntentSampleStore {
         fallback.put(IntentCategory.BILLING, List.of("为什么扣了两次款", "申请退款", "发票问题"));
         fallback.put(IntentCategory.ACCOUNT, List.of("修改邮箱", "注销账户", "更新个人信息"));
         fallback.put(IntentCategory.FEEDBACK, List.of("服务很棒", "非常满意", "给个好评"));
-        return fallback;
+        fallback.put(IntentCategory.OTHER, List.of("今天天气怎么样", "帮我写一首诗", "asdfghjkl"));
+        return Collections.unmodifiableMap(fallback);
     }
 }

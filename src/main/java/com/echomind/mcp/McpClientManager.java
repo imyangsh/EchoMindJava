@@ -25,7 +25,13 @@ public class McpClientManager implements DisposableBean {
 
     private final EchoMindProperties properties;
     private final ObjectMapper objectMapper;
-    private final Map<String, McpClient> clients = new LinkedHashMap<>();
+    /**
+     * volatile 不可变引用：reload 时先构建新 map，再整体原子替换，
+     * 最后延迟关闭旧客户端。旧实现是原地 clear + put 的 LinkedHashMap，
+     * 与并发中的 listTools/callTool 同时执行会抛 ConcurrentModificationException
+     * 或让调用方拿到已关闭的客户端。
+     */
+    private volatile Map<String, McpClient> clients = Map.of();
     private final Map<String, List<McpToolInfo>> toolCache = new ConcurrentHashMap<>();
     private final McpSchemaValidator schemaValidator;
 
@@ -41,31 +47,46 @@ public class McpClientManager implements DisposableBean {
     }
 
     public synchronized Map<String, Object> reload() {
-        clients.values().forEach(McpClient::close);
-        clients.clear();
-        toolCache.clear();
+        Map<String, McpClient> oldClients = clients;
+        Map<String, McpClient> newClients = new LinkedHashMap<>();
         EchoMindProperties.Mcp mcp = properties.getMcp();
-        if (!mcp.isEnabled()) {
+        if (mcp.isEnabled()) {
+            mcp.getServers().forEach((name, server) -> {
+                if (!server.isEnabled()) {
+                    return;
+                }
+                String transport = transport(server);
+                if ("stdio".equals(transport) && (server.getCommand() == null || server.getCommand().isBlank())) {
+                    log.warn("MCP server {} skipped because command is blank", name);
+                    return;
+                }
+                if (("http".equals(transport) || "sse".equals(transport)) && (server.getUrl() == null || server.getUrl().isBlank())) {
+                    log.warn("MCP server {} skipped because url is blank", name);
+                    return;
+                }
+                newClients.put(name, createClient(name, server));
+            });
+        } else {
             log.info("MCP protocol client is disabled");
-            return summary();
         }
-        mcp.getServers().forEach((name, server) -> {
-            if (!server.isEnabled()) {
-                return;
-            }
-            String transport = transport(server);
-            if ("stdio".equals(transport) && (server.getCommand() == null || server.getCommand().isBlank())) {
-                log.warn("MCP server {} skipped because command is blank", name);
-                return;
-            }
-            if (("http".equals(transport) || "sse".equals(transport)) && (server.getUrl() == null || server.getUrl().isBlank())) {
-                log.warn("MCP server {} skipped because url is blank", name);
-                return;
-            }
-            clients.put(name, createClient(name, server));
-        });
+        //原子替换引用后再关闭旧客户端，正在执行的调用要么用旧实例、要么用新实例，不会读到中间状态
+        clients = Map.copyOf(newClients);
+        toolCache.clear();
+        closeQuietly(oldClients);
         log.info("MCP clients configured: {}", clients.keySet());
         return summary();
+    }
+
+    private void closeQuietly(Map<String, McpClient> toClose) {
+        //逐个 try/catch：任何一个 close 抛异常不能中断其余客户端的清理，
+        //否则会残留子进程与守护线程。
+        toClose.forEach((name, client) -> {
+            try {
+                client.close();
+            } catch (Exception ex) {
+                log.warn("Failed to close MCP client {}: {}", name, ex.getMessage());
+            }
+        });
     }
 
     public List<McpToolInfo> listTools() {
@@ -171,9 +192,16 @@ public class McpClientManager implements DisposableBean {
                 return new McpCallResult(false, serverName, toolName, objectMapper.getNodeFactory().nullNode(), "invalid tool arguments: " + String.join("; ", validation.errors()), Duration.between(start, Instant.now()).toMillis());
             }
             JsonNode result = client.callTool(toolName, arguments);
+            if (result != null && result.path("isError").asBoolean(false)) {
+                return new McpCallResult(false, serverName, toolName, result,
+                        "MCP tool returned an error", Duration.between(start, Instant.now()).toMillis());
+            }
             return new McpCallResult(true, serverName, toolName, result, null, Duration.between(start, Instant.now()).toMillis());
         } catch (Exception ex) {
-            return new McpCallResult(false, serverName, toolName, objectMapper.getNodeFactory().nullNode(), ex.getMessage(), Duration.between(start, Instant.now()).toMillis());
+            //吞掉异常前先落日志，且 getMessage() 可能为 null（如 NPE），回退到 toString
+            log.warn("MCP tool call failed: {}/{}", serverName, toolName, ex);
+            String error = ex.getMessage() == null ? ex.toString() : ex.getMessage();
+            return new McpCallResult(false, serverName, toolName, objectMapper.getNodeFactory().nullNode(), error, Duration.between(start, Instant.now()).toMillis());
         }
     }
 
@@ -192,7 +220,16 @@ public class McpClientManager implements DisposableBean {
     }
 
     private List<McpToolInfo> toolsFor(String serverName, McpClient client) {
-        return toolCache.computeIfAbsent(serverName, ignored -> List.copyOf(client.listTools()));
+        //不能用 computeIfAbsent：client.listTools() 可能拉起子进程并做最长 30s 的
+        //同步 RPC，在 mapping function 里执行会长时间持有 CHM 的 bin 锁。
+        //先无锁读，miss 时在锁外计算，再 putIfAbsent 回填。
+        List<McpToolInfo> cached = toolCache.get(serverName);
+        if (cached != null) {
+            return cached;
+        }
+        List<McpToolInfo> tools = List.copyOf(client.listTools());
+        List<McpToolInfo> existing = toolCache.putIfAbsent(serverName, tools);
+        return existing != null ? existing : tools;
     }
 
     public Map<String, Object> summary() {
@@ -204,9 +241,10 @@ public class McpClientManager implements DisposableBean {
     }
 
     @Override
-    public void destroy() {
-        clients.values().forEach(McpClient::close);
-        clients.clear();
+    public synchronized void destroy() {
+        Map<String, McpClient> toClose = clients;
+        clients = Map.of();
         toolCache.clear();
+        closeQuietly(toClose);
     }
 }

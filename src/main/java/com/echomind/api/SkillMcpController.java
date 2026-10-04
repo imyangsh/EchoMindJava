@@ -35,8 +35,7 @@ public class SkillMcpController {
     @PostMapping("/skills/reload")
     @Operation(summary = "Reload skills")
     public Map<String, Object> reloadSkills() {
-        skillManager.reload();
-        return skillManager.summary();
+        return skillManager.reloadReport().summary();
     }
 
     @GetMapping("/mcp")

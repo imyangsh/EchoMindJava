@@ -30,6 +30,8 @@ public class HttpMcpClient implements McpClient {
     private final HttpClient httpClient;
     private final AtomicLong ids = new AtomicLong(1);
     private volatile boolean initialized;
+    /** Streamable HTTP 规范要求 initialize 之后的请求带回服务端下发的 Mcp-Session-Id。 */
+    private volatile String sessionId;
 
     public HttpMcpClient(
             String serverName,
@@ -59,7 +61,7 @@ public class HttpMcpClient implements McpClient {
             throw new IllegalStateException("MCP HTTP/SSE server url is blank: " + serverName);
         }
         ObjectNode params = objectMapper.createObjectNode();
-        params.put("protocolVersion", protocolVersion == null || protocolVersion.isBlank() ? "2025-06-18" : protocolVersion);
+        params.put("protocolVersion", effectiveProtocolVersion());
         params.set("capabilities", objectMapper.createObjectNode());
         ObjectNode clientInfo = objectMapper.createObjectNode();
         clientInfo.put("name", "echomind-java");
@@ -111,9 +113,23 @@ public class HttpMcpClient implements McpClient {
                 "name", serverName,
                 "enabled", serverConfig.isEnabled(),
                 "transport", transport(),
-                "url", serverConfig.getUrl() == null ? "" : serverConfig.getUrl(),
+                "url", sanitizeUrl(serverConfig.getUrl()),
                 "initialized", initialized
         );
+    }
+
+    /** 状态接口对外暴露 url 时去掉 query 与 userinfo，避免 token 泄漏。 */
+    private String sanitizeUrl(String url) {
+        if (url == null || url.isBlank()) {
+            return "";
+        }
+        try {
+            URI uri = URI.create(url);
+            URI sanitized = new URI(uri.getScheme(), null, uri.getHost(), uri.getPort(), uri.getPath(), null, null);
+            return sanitized.toString();
+        } catch (Exception ex) {
+            return "(unparseable url)";
+        }
     }
 
     private JsonNode sendRequest(String method, JsonNode params) {
@@ -123,7 +139,7 @@ public class HttpMcpClient implements McpClient {
         request.put("id", id);
         request.put("method", method);
         request.set("params", params == null ? objectMapper.createObjectNode() : params);
-        JsonNode message = postJson(request, true);
+        JsonNode message = postJson(request, true, id);
         JsonNode error = message.get("error");
         if (error != null && !error.isNull()) {
             throw new IllegalStateException(error.toString());
@@ -137,42 +153,120 @@ public class HttpMcpClient implements McpClient {
         request.put("jsonrpc", "2.0");
         request.put("method", method);
         request.set("params", params == null ? objectMapper.createObjectNode() : params);
-        postJson(request, false);
+        postJson(request, false, null);
     }
 
-    private JsonNode postJson(JsonNode payload, boolean expectResponse) {
+    private JsonNode postJson(JsonNode payload, boolean expectResponse, Long expectedId) {
         try {
             HttpRequest.Builder builder = HttpRequest.newBuilder()
                     .uri(URI.create(serverConfig.getUrl()))
                     .timeout(Duration.ofMillis(timeoutMs()))
                     .header("Content-Type", "application/json")
-                    .header("Accept", "sse".equals(transport()) ? "text/event-stream, application/json" : "application/json")
+                    .header("Accept", "sse".equals(transport()) ? "text/event-stream, application/json" : "application/json, text/event-stream")
+                    .header("MCP-Protocol-Version", effectiveProtocolVersion())
                     .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(payload)));
+            String session = sessionId;
+            if (session != null && !session.isBlank()) {
+                builder.header("Mcp-Session-Id", session);
+            }
             serverConfig.getHeaders().forEach(builder::header);
             HttpResponse<String> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+            //Streamable HTTP：保存 initialize 响应中的会话 id，后续请求带回
+            response.headers().firstValue("Mcp-Session-Id").ifPresent(value -> sessionId = value);
+            if (response.statusCode() == 404 && initialized) {
+                //会话失效：按规范应重新 initialize
+                initialized = false;
+                sessionId = null;
+                throw new IllegalStateException("MCP session expired (HTTP 404), will re-initialize on next call");
+            }
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                throw new IllegalStateException("HTTP " + response.statusCode() + ": " + response.body());
+                throw new IllegalStateException("HTTP " + response.statusCode() + ": " + truncate(response.body(), 500));
             }
             if (!expectResponse || response.body() == null || response.body().isBlank()) {
                 return objectMapper.createObjectNode();
             }
-            return parseResponseBody(response.body(), response.headers().firstValue("content-type").orElse(""));
+            return parseResponseBody(response.body(), response.headers().firstValue("content-type").orElse(""), expectedId);
+        } catch (IllegalStateException ex) {
+            throw ex;
         } catch (Exception ex) {
+            if (ex instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             throw new IllegalStateException("MCP HTTP request failed: " + serverName + ": " + ex.getMessage(), ex);
         }
     }
 
-    private JsonNode parseResponseBody(String body, String contentType) throws Exception {
+    private JsonNode parseResponseBody(String body, String contentType, Long expectedId) throws Exception {
         if (contentType.toLowerCase(Locale.ROOT).contains("text/event-stream") || body.lines().anyMatch(line -> line.startsWith("data:"))) {
-            String data = body.lines()
-                    .filter(line -> line.startsWith("data:"))
-                    .map(line -> line.substring("data:".length()).trim())
-                    .filter(line -> !line.isBlank() && !"[DONE]".equals(line))
-                    .reduce((first, second) -> second)
-                    .orElse("{}");
-            return objectMapper.readTree(data);
+            //按 SSE 规范以空行分隔事件、拼接每个事件的多行 data；
+            //从所有事件中选出与请求 id 匹配的那条响应，
+            //旧实现取“最后一条 data 行”，最后一条是 ping/notification 时会拿到错误消息体。
+            JsonNode matched = null;
+            JsonNode lastParsed = null;
+            StringBuilder data = new StringBuilder();
+            List<String> lines = new ArrayList<>(body.lines().toList());
+            lines.add(""); //确保最后一个事件被冲刷
+            for (String line : lines) {
+                if (line.isBlank()) {
+                    if (!data.isEmpty()) {
+                        String eventData = data.toString();
+                        data.setLength(0);
+                        if (!"[DONE]".equals(eventData.trim())) {
+                            try {
+                                JsonNode node = objectMapper.readTree(eventData);
+                                lastParsed = node;
+                                if (matchesId(node, expectedId)) {
+                                    matched = node;
+                                }
+                            } catch (Exception ignored) {
+                                //忽略非 JSON 的事件数据
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if (line.startsWith("data:")) {
+                    if (!data.isEmpty()) {
+                        data.append('\n');
+                    }
+                    data.append(line.substring("data:".length()).trim());
+                }
+            }
+            if (matched != null) {
+                return matched;
+            }
+            return lastParsed == null ? objectMapper.createObjectNode() : lastParsed;
         }
-        return objectMapper.readTree(body);
+        JsonNode node = objectMapper.readTree(body);
+        if (expectedId != null && node.has("id") && !matchesId(node, expectedId)) {
+            throw new IllegalStateException("MCP response id mismatch: expected " + expectedId + ", got " + node.get("id"));
+        }
+        return node;
+    }
+
+    private boolean matchesId(JsonNode node, Long expectedId) {
+        if (expectedId == null || node == null) {
+            return false;
+        }
+        JsonNode idNode = node.get("id");
+        if (idNode == null || idNode.isNull()) {
+            return false;
+        }
+        if (idNode.canConvertToLong()) {
+            return idNode.asLong() == expectedId;
+        }
+        return idNode.isTextual() && idNode.asText().trim().equals(String.valueOf(expectedId));
+    }
+
+    private String truncate(String value, int max) {
+        if (value == null) {
+            return "";
+        }
+        return value.length() <= max ? value : value.substring(0, max) + "...(truncated)";
+    }
+
+    private String effectiveProtocolVersion() {
+        return protocolVersion == null || protocolVersion.isBlank() ? "2025-06-18" : protocolVersion;
     }
 
     private long timeoutMs() {
@@ -190,5 +284,13 @@ public class HttpMcpClient implements McpClient {
     @Override
     public void close() {
         initialized = false;
+        sessionId = null;
+        //Java 21 起 HttpClient 实现 AutoCloseable：不关闭会在每次 reload 后
+        //泄漏 selector 线程与连接池，最终 OOM: unable to create native thread。
+        try {
+            httpClient.close();
+        } catch (Exception ex) {
+            log.debug("Failed to close HttpClient for {}: {}", serverName, ex.getMessage());
+        }
     }
 }
