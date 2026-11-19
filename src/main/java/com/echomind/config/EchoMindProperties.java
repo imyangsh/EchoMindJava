@@ -32,8 +32,8 @@ public class EchoMindProperties {
     public Agent getAgent() { return agent; }
 
     public static class Agent {
-        private long requestTimeoutMs = 120000;
-        private long branchTimeoutMs = 60000;
+        private long requestTimeoutMs = 50000;
+        private long branchTimeoutMs = 30000;
         private long verificationTimeoutMs = 8000;
         private int maxRepairAttempts = 1;
         private int contextMaxChars = 18000;
@@ -590,6 +590,52 @@ public class EchoMindProperties {
         private String apiKey = "";
         /** CORS 允许的来源列表，为空表示不开放跨域。 */
         private List<String> corsAllowedOrigins = List.of();
+        /** 服务端用户凭证；环境变量 JSON 同名用户覆盖 YAML 配置，值不得写入日志。 */
+        private Map<String, String> userKeys = new LinkedHashMap<>();
+        private Map<String, String> environmentUserKeys = new LinkedHashMap<>();
+        private boolean userKeysJsonValid = true;
+        private int userRequestsPerMinute = 60;
+
+        public Map<String, String> getUserKeys() {
+            if (!userKeysJsonValid) return Map.of();
+            Map<String, String> combined = new LinkedHashMap<>(userKeys);
+            combined.putAll(environmentUserKeys);
+            return java.util.Collections.unmodifiableMap(combined);
+        }
+
+        public void setUserKeys(Map<String, String> value) {
+            userKeys = value == null ? new LinkedHashMap<>() : new LinkedHashMap<>(value);
+        }
+
+        /** A JSON string permits configuring multiple user credentials through .env/Compose. */
+        public void setUserKeysJson(String value) {
+            if (value == null || value.isBlank()) {
+                environmentUserKeys = new LinkedHashMap<>();
+                userKeysJsonValid = true;
+                return;
+            }
+            try {
+                var object = new com.fasterxml.jackson.databind.ObjectMapper()
+                        .enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+                        .enable(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readTree(value);
+                if (object == null || !object.isObject()) throw new IllegalArgumentException();
+                Map<String, String> parsed = new LinkedHashMap<>();
+                object.fields().forEachRemaining(entry -> {
+                    if (!entry.getValue().isTextual()) throw new IllegalArgumentException();
+                    parsed.put(entry.getKey(), entry.getValue().textValue());
+                });
+                environmentUserKeys = parsed;
+                userKeysJsonValid = true;
+            } catch (Exception ex) {
+                // Boot's BindFailureAnalyzer echoes the rejected property value. Do not throw
+                // during binding: invalidate all user credentials, including YAML fallback.
+                environmentUserKeys = new LinkedHashMap<>();
+                userKeysJsonValid = false;
+            }
+        }
+
+        public int getUserRequestsPerMinute() { return userRequestsPerMinute; }
+        public void setUserRequestsPerMinute(int value) { userRequestsPerMinute = Math.max(1, value); }
 
         public String getApiKey() {
             return apiKey;

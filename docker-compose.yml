@@ -19,8 +19,7 @@ services:
       retries: 5
 
   chromadb:
-    # Spring AI 1.1.0 官方集成测试对应 chroma 1.0.0；0.5.x 的 API 校验与错误信息
-    # 与之不兼容，会导致应用启动（集合查询）和向量写入（upsert）失败
+    # LangChain4j 显式使用 v2 API；保留现有 Chroma 版本和持久化卷。
     image: chromadb/chroma:1.0.0
     container_name: echomind-java-chromadb
     ports:
@@ -57,6 +56,13 @@ services:
       - MEMORY_STORE_PATH=/app/data/java/memory-store.json
       - LLM_FALLBACK_ENABLED=true
       - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE:-anthropic}
+      # 总预算低于 nginx 的 60s；覆盖到 50s 以上时须同步调整代理等待时间。
+      # 显式转发，确保 shell 与 .env 的配置均可覆盖容器默认值。
+      - AGENT_REQUEST_TIMEOUT_MS=${AGENT_REQUEST_TIMEOUT_MS:-50000}
+      - AGENT_BRANCH_TIMEOUT_MS=${AGENT_BRANCH_TIMEOUT_MS:-30000}
+      - AGENT_VERIFICATION_TIMEOUT_MS=${AGENT_VERIFICATION_TIMEOUT_MS:-8000}
+      - AI_CONNECT_TIMEOUT=${AI_CONNECT_TIMEOUT:-3s}
+      - AI_READ_TIMEOUT=${AI_READ_TIMEOUT:-30s}
       # 独立 EmbeddingModel：阿里云百炼 text-embedding-v4（OpenAI 兼容接口）
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
       - DASHSCOPE_BASE_URL=${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com}
@@ -64,9 +70,15 @@ services:
       - DASHSCOPE_EMBEDDING_MODEL=${DASHSCOPE_EMBEDDING_MODEL:-text-embedding-v4}
       - DASHSCOPE_EMBEDDING_DIMENSIONS=${DASHSCOPE_EMBEDDING_DIMENSIONS:-1024}
       - CHROMA_COLLECTION=${CHROMA_COLLECTION:-echomind_knowledge_dashscope_te4_1024_v1}
+      - CHROMA_ENABLED=${CHROMA_ENABLED:-true}
+      - CHROMA_TENANT=${CHROMA_TENANT:-default_tenant}
+      - CHROMA_DATABASE=${CHROMA_DATABASE:-default_database}
       # 管理接口（/knowledge/**、/mcp/**、/eval/** 等）的 API Key；
       # 不设置时管理接口一律拒绝访问（fail-closed）
       - ECHOMIND_API_KEY=${ECHOMIND_API_KEY:-}
+      # 业务用户身份与配额；JSON 映射也支持 shell 覆盖 .env。
+      - ECHOMIND_USER_KEYS=${ECHOMIND_USER_KEYS:-}
+      - ECHOMIND_USER_REQUESTS_PER_MINUTE=${ECHOMIND_USER_REQUESTS_PER_MINUTE:-60}
     volumes:
       - app-data:/app/data
     depends_on:

@@ -6,6 +6,7 @@ EchoMind Java 是一个基于 Spring Boot 的智能客服 Agent 项目。它围�
 
 - General / Technical / Billing 多 Agent 路由
 - Redis 工作记忆、长期记忆和用户画像持久化
+- 独立用户凭证、会话归属和并发租约、Redis 用户配额
 - Hybrid RAG：BM25、EmbeddingModel / hash vector、可选 ChromaDB 召回、RRF 融合、LLM rerank
 - 知识库来源引用、上下文窗口扩展、证据不足降级
 - 外置意图样本、Embedding 语义匹配和动态 Skills 注入
@@ -23,10 +24,10 @@ EchoMind Java 是一个基于 Spring Boot 的智能客服 Agent 项目。它围�
 |---|---|
 | Runtime | Java 21 |
 | Web | Spring Boot 3.5, Spring MVC |
-| Security | Spring Security（API Key 鉴权） |
-| LLM | Spring AI Anthropic, Spring AI DeepSeek |
+| Security | Spring Security（管理 API Key + 独立用户凭证、会话授权） |
+| LLM | LangChain4j Anthropic、OpenAI 兼容 DeepSeek（BOM 1.22.0） |
 | Embedding | 阿里云百炼 `text-embedding-v4`（与 ChatModel 独立配置） |
-| RAG | BM25, Spring AI EmbeddingModel, local hash vector fallback, Spring AI Chroma VectorStore, RRF/weighted fusion, LLM rerank |
+| RAG | BM25, LangChain4j EmbeddingModel / Chroma EmbeddingStore, local hash vector fallback, RRF/weighted fusion, LLM rerank |
 | Memory | Redis + JSON store |
 | Tools | AgentToolRegistry, MCP stdio/http/sse |
 | API Docs | Springdoc OpenAPI, Swagger UI |
@@ -69,6 +70,8 @@ POST /chat
 | 工具注册表 | `src/main/java/com/echomind/agent/AgentToolRegistry.java` |
 | RAG 检索 | `src/main/java/com/echomind/knowledge/KnowledgeBaseService.java` |
 | 文本向量 | `src/main/java/com/echomind/knowledge/TextEmbeddingService.java` |
+| 模型配置 | `src/main/java/com/echomind/config/LangChain4jConfig.java` |
+| 模型网关 | `src/main/java/com/echomind/llm/LangChain4jLlmGateway.java` |
 | 意图样本 | `src/main/resources/intent-samples.json` |
 | MCP 客户端 | `src/main/java/com/echomind/mcp/` |
 | Skills 加载 | `src/main/java/com/echomind/skill/SkillManager.java` |
@@ -93,7 +96,7 @@ Windows PowerShell:
 docker compose up -d redis chromadb
 ```
 
-### 3. 配置模型
+### 3. 配置模型与凭证
 
 复制环境变量文件：
 
@@ -106,6 +109,17 @@ Windows PowerShell:
 ```powershell
 Copy-Item .env.example .env
 ```
+
+为业务接口设置独立用户凭证；需要调用管理接口时另设管理凭证：
+
+```env
+ECHOMIND_USER_KEYS={"u1001":"replace-with-a-long-random-user-secret"}
+ECHOMIND_API_KEY=replace-with-a-different-long-random-admin-secret
+```
+
+请替换示例值，用户和管理凭证必须不同。Docker Compose 会读取 `.env`；
+应用从项目根目录直接启动时也会读取该文件，同名进程环境变量优先。
+客户端调用 `/chat`、`/search` 时发送 `X-User-Key`，完整规则见下方“用户身份、会话与配额”。
 
 默认 profile 是 Anthropic：
 
@@ -140,8 +154,13 @@ DASHSCOPE_EMBEDDING_MODEL=text-embedding-v4
 LLM_FALLBACK_ENABLED=true
 ```
 
-`LLM_FALLBACK_ENABLED` 只控制聊天调用的本地降级。百炼 EmbeddingModel 在应用启动时装配，
-因此必须提供有效的 `DASHSCOPE_API_KEY`；Key 只通过环境变量传入，不要写入 Git。
+`LLM_FALLBACK_ENABLED` 只控制聊天调用的本地降级；结构化调用失败仍向上抛出异常。
+配置 `DASHSCOPE_API_KEY` 后才装配百炼 EmbeddingModel；未配置时使用本地 hash 向量，
+并跳过 Chroma。需要真实语义检索时请提供有效 Key，只通过环境变量传入。
+
+LangChain4j 迁移说明见 [docs/langchain4j-migration.md](docs/langchain4j-migration.md)。
+现有 Anthropic / DeepSeek profile 和环境变量继续有效；原先直接设置的 `spring.ai.*`
+配置需改为 `application.yml` 中的 `langchain4j.*`。可设 `CHROMA_ENABLED=false` 只使用本地检索。
 
 ### 4. 启动应用
 
@@ -202,7 +221,9 @@ docker compose down
 
 默认端口：`8080`
 
-> 鉴权说明：`/health`、`/chat`、`/search` 与 Swagger 文档公开访问；
+> 鉴权说明：`/health` 与 Swagger 文档公开访问；`/chat`、`/search` 需要
+> 请求头 `X-User-Key: <用户凭证>`，身份来自服务端配置的用户映射。
+> 未配置用户凭证时，业务接口拒绝访问。
 > 其余管理接口（`/knowledge/**`、`/skills/**`、`/mcp/**`、`/monitor`、`/metrics`、`/eval/**`）
 > 需要请求头 `X-API-Key: <ECHOMIND_API_KEY>`。未配置 `ECHOMIND_API_KEY` 时，
 > 管理接口一律拒绝访问（fail-closed）。
@@ -233,6 +254,7 @@ docker compose down
 
 ```bash
 curl -X POST http://localhost:8080/chat \
+  -H "X-User-Key: $ECHOMIND_USER_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "message": "我想申请退款，订单号是 12345",
@@ -267,7 +289,8 @@ curl -X POST http://localhost:8080/chat \
 ### 知识库检索
 
 ```bash
-curl -X POST "http://localhost:8080/search?query=退款多久能到账&topK=3"
+curl -X POST "http://localhost:8080/search?query=退款多久能到账&topK=3" \
+  -H "X-User-Key: $ECHOMIND_USER_KEY"
 ```
 
 ### 添加知识库
@@ -296,6 +319,33 @@ curl -X POST http://localhost:8080/knowledge/upload \
 > 上传仅支持 `.md` / `.txt` / `.json`，单文件不超过 10MB。
 ```
 
+## 用户身份、会话与配额
+
+服务端通过环境变量 `ECHOMIND_USER_KEYS` 配置用户 ID 到独立随机凭证的 JSON 映射，
+例如 `{"u1001":"replace-with-a-long-random-user-secret"}`。也可通过外部 YAML 的
+`echomind.security.user-keys` 配置；环境变量 JSON 覆盖同名用户的 YAML 条目。
+用户 ID 支持 1–128 个 ASCII 字母、数字、`.`、`_`、`@`、`-`，首字符必须是字母或数字；
+保留名 `anonymous` 不可作为认证身份。重复凭证、无效条目会拒绝用户认证；
+用户凭证与管理凭证相同则同时禁用用户和管理鉴权，修复配置后重启生效。
+无效或存在重复键/尾随内容的 JSON 会禁用全部用户凭证，
+保持管理接口可用；不在绑定错误中回显凭证内容。
+不要在前端公开整个凭证映射，真实凭证仅保存于服务端配置中。
+
+客户端只发送自己的 `X-User-Key`。上面的 curl 示例使用客户端环境变量
+`ECHOMIND_USER_KEY` 保存这一个凭证，它不同于服务端的 `ECHOMIND_USER_KEYS` 映射。
+`user_id` 可以省略；传入时必须等于认证身份，冒充其他用户返回 403。
+管理凭证不授予业务用户身份，业务用户凭证也不能调用管理接口。
+在 `/docs` 的 Authorize 中分别填写 UserKey 或 AdminKey，文档会按接口选择对应请求头。
+
+`conversation_id` 可省略，由服务端生成。Redis 原子绑定会话归属，并为处理中的会话持有租约：
+其他用户使用同一会话 ID 返回 403，同一会话重叠请求返回 409，客户端应等待前一轮完成后重试。
+归属按工作记忆 TTL 和请求预算设置保留期；租约释放只删除当前请求持有的令牌，异常退出由租约过期恢复。
+访问控制存储不可用返回 503，不继续执行对话。
+
+每个用户的 `/chat` 和 `/search` 共享 Redis 配额，默认首次请求起 60 秒内最多 60 次，
+可通过 `ECHOMIND_USER_REQUESTS_PER_MINUTE` 调整。超限返回 429 和 `Retry-After`，
+Redis 故障返回 503；认证失败不进入用户配额。Nginx 原有 IP 限流继续生效。
+
 ## RAG 和知识库
 
 文档导入链路：
@@ -307,7 +357,7 @@ curl -X POST http://localhost:8080/knowledge/upload \
   -> previous_chunk_id / next_chunk_id
   -> 批量 Embedding + 真倒排 BM25 索引 + 独立 hash 索引
   -> JSON 持久化正文、向量空间、模型与内容指纹
-  -> 批量 Spring AI VectorStore 写入（可用时）
+  -> 复用已生成向量，批量写入 LangChain4j EmbeddingStore（可用时）
 ```
 
 查询链路：
@@ -616,6 +666,12 @@ curl -X POST http://localhost:8080/mcp/tools/remote/search/call \
 - `MEMORY_WORKING_MAX` 控制工作记忆窗口
 - `MEMORY_COMPRESS_AT` 控制压缩触发阈值
 
+最终用户消息与已校验的助手回答作为一个 turn 原子写入 Redis，助手的质量元数据继续保留。
+压缩与画像更新由独立有界后台执行器处理，同一会话任务合并，避免在请求中等待模型摘要。
+压缩提交会核对快照，保留摘要生成期间新追加的消息；未通过校验的助手草稿不进入可信长期记忆。
+情景向量保存模型空间标识，只比较同空间向量；临时 hash 降级使用独立 hash 比较，
+真实模型恢复后按需补建该用户的向量。旧 JSON 仍可加载，无历史用户不会产生空召回的 Embedding 调用。
+
 配置：
 
 ```yaml
@@ -690,6 +746,16 @@ Windows PowerShell：
 - RAG 切块、metadata、上下文扩展
 - RAG 检索评测指标
 
+新增用户鉴权与会话授权、共享配额、记忆向量隔离与恢复、后台压缩并发保留、部署超时预算回归。
+默认测试使用替代外部服务；可指定本地 `redis-server` 可执行文件，启用额外真实 Redis Lua 测试：
+
+```powershell
+.\mvnw.cmd "-Dechomind.test.redis-server=D:\path\to\redis-server.exe" test
+```
+
+这些测试自行启动随机 loopback 端口、关闭持久化的临时实例，测试结束后只关闭自己创建的进程，
+不读取 `.env` 或连接现有 Redis。它们验证原子配额、窗口过期、会话归属/租约、并发摘要裁剪。
+
 ## 目录结构
 
 ```text
@@ -716,9 +782,9 @@ src/main/java/com/echomind
 | `SPRING_PROFILES_ACTIVE` | `anthropic` | 模型 profile |
 | `ANTHROPIC_API_KEY` | 空 | Anthropic API Key |
 | `DEEPSEEK_API_KEY` | 空 | DeepSeek API Key |
-| `DASHSCOPE_API_KEY` | 无（必填） | 阿里云百炼 API Key，仅供 EmbeddingModel 使用 |
+| `DASHSCOPE_API_KEY` | 无 | 阿里云百炼 API Key；未配置时使用本地 hash 向量 |
 | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com` | 百炼北京地域 API 根地址；可换成业务空间专属域名 |
-| `DASHSCOPE_EMBEDDINGS_PATH` | `/compatible-mode/v1/embeddings` | 百炼 OpenAI 兼容 Embedding 路径 |
+| `DASHSCOPE_EMBEDDINGS_PATH` | `/compatible-mode/v1/embeddings` | 百炼 OpenAI 兼容路径，须以 `/` 开头、`/embeddings` 结尾 |
 | `DASHSCOPE_EMBEDDING_MODEL` | `text-embedding-v4` | 独立 Embedding 模型 |
 | `DASHSCOPE_EMBEDDING_DIMENSIONS` | `1024` | 向量维度；改变后必须使用新 collection |
 | `LLM_FALLBACK_ENABLED` | `true` | LLM 失败时是否使用本地降级回复 |
@@ -726,6 +792,7 @@ src/main/java/com/echomind
 | `REDIS_PORT` | `6380` | Redis port（宿主机默认映射） |
 | `REDIS_PASSWORD` | `echomind123` | Redis password |
 | `CHROMA_HOST` | `http://localhost` | Chroma host |
+| `CHROMA_ENABLED` | `true` | 是否启用 Chroma；需要已配置的外部 EmbeddingModel |
 | `CHROMA_PORT` | `8002` | Chroma port（宿主机默认映射） |
 | `CHROMA_COLLECTION` | `echomind_knowledge_dashscope_te4_1024_v1` | Chroma collection；更换向量模型或维度时需改名 |
 | `ECHOMIND_DATA_DIR` | `data/java` | 数据目录 |
@@ -744,10 +811,18 @@ src/main/java/com/echomind
 | `INTENT_CACHE_TTL_SECONDS` | `300` | 识别缓存有效期，0 表示关闭 |
 | `MCP_ENABLED` | `false` | 是否启用 MCP |
 | `ECHOMIND_API_KEY` | 空 | 管理接口 API Key（X-API-Key 头）；为空时管理接口拒绝访问 |
+| `ECHOMIND_USER_KEYS` | 空 | 用户 ID 到凭证的 JSON 映射（X-User-Key 头）；为空时业务接口拒绝访问 |
+| `ECHOMIND_USER_REQUESTS_PER_MINUTE` | `60` | 每个用户 chat/search 共享的 60 秒窗口配额 |
+| `AGENT_REQUEST_TIMEOUT_MS` | `50000` | 请求总等待预算；必须低于网关等待时间 |
+| `AGENT_BRANCH_TIMEOUT_MS` | `30000` | 分支预算，同时受请求剩余时间限制 |
 | `ECHOMIND_CORS_ORIGINS` | 空 | CORS 允许来源（逗号分隔），为空不开放跨域 |
 | `MCP_AUTO_TOOL_ENABLED` | `true` | Agent 是否自动选择 MCP 工具 |
 
 ## 当前限制
+
+- 用户认证当前采用服务端配置的独立 API 凭证，尚未接入登录页面、OAuth2/OIDC 或用户自助凭证管理。
+- 默认应用预算 50 秒、分支 30 秒，模型读取 30 秒、连接 3 秒，Nginx 等待 60 秒；提高应用预算时必须同步调整网关。同步 Servlet 请求不能即时感知客户端提前断开，非中断式远端 I/O 仍依赖传输超时。
+- 长期记忆与画像仍为单实例 JSON 持久化；会话归属、租约和配额通过共享 Redis 控制。扩展多副本前需要统一长期存储，现有记忆压缩 Lua 不面向 Redis Cluster 部署。
 
 - ChromaDB 召回依赖阿里云百炼 Embedding API；短时调用失败时本地检索仍可降级到 BM25 + hash vector，但 Chroma 写入或查询会跳过。
 - hash 向量主要反映词面与 n-gram 重合，弱证据路径仍可能误接纳带领域词的域外表达；局部否定规则也不能覆盖反讽、引用和所有复杂语法。泛化质量需要真实 LLM/embedding 与独立线上标注数据验证。

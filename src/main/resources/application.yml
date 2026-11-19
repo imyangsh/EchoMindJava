@@ -19,8 +19,7 @@ spring:
   mvc:
     pathmatch:
       matching-strategy: ANT_PATH_MATCHER
-  # 自动配置的 RestClient/RestTemplate（含 Spring AI 的 LLM 调用）默认读超时是无限，
-  # 上游网关挂起会把工作线程永久占住，必须显式设超时
+  # 应用内 Spring HTTP 客户端的超时；LangChain4j 在下方单独绑定同一组环境变量。
   http:
     client:
       connect-timeout: ${AI_CONNECT_TIMEOUT:3s}
@@ -39,50 +38,40 @@ spring:
       port: ${REDIS_PORT:6380}
       password: ${REDIS_PASSWORD:echomind123}
       timeout: 2s
-  ai:
-    # ChatModel 由 anthropic/deepseek profile 选择；EmbeddingModel 独立使用阿里云百炼。
-    model:
-      # 复用 OpenAI starter 调用百炼的 OpenAI 兼容 Embedding API；starter 还包含
-      # chat/image/audio/moderation 自动配置，因此全部显式关闭。chat 会由下方 profile 覆盖。
-      chat: none
-      embedding: openai
-      image: none
-      moderation: none
-      audio:
-        speech: none
-        transcription: none
-    openai:
-      embedding:
-        api-key: ${DASHSCOPE_API_KEY}
-        # 默认使用百炼北京地域公共端点；生产环境可通过 DASHSCOPE_BASE_URL
-        # 换成业务空间专属域名：https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com
-        base-url: ${DASHSCOPE_BASE_URL:https://dashscope.aliyuncs.com}
-        embeddings-path: ${DASHSCOPE_EMBEDDINGS_PATH:/compatible-mode/v1/embeddings}
-        options:
-          model: ${DASHSCOPE_EMBEDDING_MODEL:text-embedding-v4}
-          dimensions: ${DASHSCOPE_EMBEDDING_DIMENSIONS:1024}
-    anthropic:
-      api-key: ${ANTHROPIC_API_KEY:${LLM_STARTUP_API_KEY:echomind-local-placeholder}}
-      base-url: ${ANTHROPIC_BASE_URL:https://api.anthropic.com}
-      chat:
-        options:
-          model: ${ANTHROPIC_MODEL:claude-3-5-sonnet-20241022}
-          temperature: 0.2
-          max-tokens: 1024
-    vectorstore:
-      chroma:
-        client:
-          # 同上：默认连 docker compose 映射到宿主机的 8002；
-          # 容器内由 compose 注入 CHROMA_HOST=http://chromadb/CHROMA_PORT=8000 覆盖
-          host: ${CHROMA_HOST:http://localhost}
-          port: ${CHROMA_PORT:8002}
-        # collection 名包含 embedding 模型版本，避免和旧模型生成的不同维度向量混用。
-        collection-name: ${CHROMA_COLLECTION:echomind_knowledge_dashscope_te4_1024_v1}
-        # Spring AI 1.1.0 默认租户/数据库为 SpringAiTenant/SpringAiDatabase，本项目实际数据
-        # 位于 default_tenant/default_database；不对齐会查不到集合导致 vectorStore 启动失败
-        tenant-name: ${CHROMA_TENANT:default_tenant}
-        database-name: ${CHROMA_DATABASE:default_database}
-        initialize-schema: true
+
+langchain4j:
+  # 显式装配模型，避免 provider starter 自动配置冲突。
+  provider: anthropic
+  connect-timeout: ${AI_CONNECT_TIMEOUT:3s}
+  read-timeout: ${AI_READ_TIMEOUT:30s}
+  anthropic:
+    api-key: ${ANTHROPIC_API_KEY:${LLM_STARTUP_API_KEY:echomind-local-placeholder}}
+    base-url: ${ANTHROPIC_BASE_URL:https://api.anthropic.com}
+    model-name: ${ANTHROPIC_MODEL:claude-3-5-sonnet-20241022}
+    temperature: 0.2
+    max-tokens: 1024
+  deepseek:
+    api-key: ${DEEPSEEK_API_KEY:${LLM_STARTUP_API_KEY:echomind-local-placeholder}}
+    base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
+    model-name: ${DEEPSEEK_MODEL:deepseek-chat}
+    temperature: ${DEEPSEEK_TEMPERATURE:0.2}
+    max-tokens: ${DEEPSEEK_MAX_TOKENS:1024}
+  embedding:
+    # OpenAI 兼容接口；ChatModel 切换不影响百炼 EmbeddingModel。
+    # 未配置 Key 时使用本地 hash 降级；网络故障时仍由 TextEmbeddingService 处理恢复。
+    api-key: ${DASHSCOPE_API_KEY:}
+    base-url: ${DASHSCOPE_BASE_URL:https://dashscope.aliyuncs.com}
+    embeddings-path: ${DASHSCOPE_EMBEDDINGS_PATH:/compatible-mode/v1/embeddings}
+    model-name: ${DASHSCOPE_EMBEDDING_MODEL:text-embedding-v4}
+    dimensions: ${DASHSCOPE_EMBEDDING_DIMENSIONS:1024}
+  chroma:
+    enabled: ${CHROMA_ENABLED:true}
+    host: ${CHROMA_HOST:http://localhost}
+    port: ${CHROMA_PORT:8002}
+    collection-name: ${CHROMA_COLLECTION:echomind_knowledge_dashscope_te4_1024_v1}
+    # 保留现有 v2 租户、数据库和集合，兼容既有向量数据。
+    tenant-name: ${CHROMA_TENANT:default_tenant}
+    database-name: ${CHROMA_DATABASE:default_database}
 
 management:
   endpoints:
@@ -103,13 +92,19 @@ echomind:
     # 管理接口（/knowledge/**、/mcp/**、/eval/**、/skills/**、/monitor、/metrics）的
     # API Key，请求时放在 X-API-Key 头。为空时管理接口一律返回 401/403（fail-closed）。
     api-key: ${ECHOMIND_API_KEY:}
+    # 业务端点 /chat、/search 使用独立的 X-User-Key，用户身份由服务端绑定。
+    # JSON 示例：{"u1001":"random-user-secret"}；未配置时业务端点拒绝访问。
+    user-keys: {}
+    user-keys-json: ${ECHOMIND_USER_KEYS:}
+    user-requests-per-minute: ${ECHOMIND_USER_REQUESTS_PER_MINUTE:60}
     # CORS 允许来源，逗号分隔；为空表示不开放跨域
     cors-allowed-origins: ${ECHOMIND_CORS_ORIGINS:}
   llm:
     fallback-enabled: ${LLM_FALLBACK_ENABLED:true}
   agent:
-    request-timeout-ms: ${AGENT_REQUEST_TIMEOUT_MS:120000}
-    branch-timeout-ms: ${AGENT_BRANCH_TIMEOUT_MS:60000}
+    # Nginx 等待 60s，应用最多等待 50s，保留返回超时响应的余量。
+    request-timeout-ms: ${AGENT_REQUEST_TIMEOUT_MS:50000}
+    branch-timeout-ms: ${AGENT_BRANCH_TIMEOUT_MS:30000}
     verification-timeout-ms: ${AGENT_VERIFICATION_TIMEOUT_MS:8000}
     max-repair-attempts: ${AGENT_MAX_REPAIR_ATTEMPTS:1}
     context-max-chars: ${AGENT_CONTEXT_MAX_CHARS:18000}
@@ -206,29 +201,13 @@ spring:
   config:
     activate:
       on-profile: deepseek
-  autoconfigure:
-    exclude:
-      - org.springframework.ai.model.anthropic.autoconfigure.AnthropicChatAutoConfiguration
-  ai:
-    model:
-      chat: deepseek
-    deepseek:
-      api-key: ${DEEPSEEK_API_KEY:${LLM_STARTUP_API_KEY:echomind-local-placeholder}}
-      base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
-      chat:
-        options:
-          model: ${DEEPSEEK_MODEL:deepseek-chat}
-          temperature: ${DEEPSEEK_TEMPERATURE:0.2}
-          max-tokens: ${DEEPSEEK_MAX_TOKENS:1024}
+langchain4j:
+  provider: deepseek
 
 ---
 spring:
   config:
     activate:
       on-profile: anthropic
-  autoconfigure:
-    exclude:
-      - org.springframework.ai.model.deepseek.autoconfigure.DeepSeekChatAutoConfiguration
-  ai:
-    model:
-      chat: anthropic
+langchain4j:
+  provider: anthropic

@@ -8,7 +8,8 @@ import com.echomind.tool.KnowledgeToolManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.springframework.ai.vectorstore.VectorStore;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.data.segment.TextSegment;
 import org.springframework.beans.factory.ObjectProvider;
 
 import java.nio.file.Path;
@@ -68,35 +69,35 @@ class AgentToolRegistryTest {
         assertThat(result.result().path("results")).isNotEmpty();
     }
 
-    private ObjectProvider<VectorStore> noVectorStore() {
+    private ObjectProvider<EmbeddingStore<TextSegment>> noVectorStore() {
         return new ObjectProvider<>() {
             @Override
-            public VectorStore getObject(Object... args) {
+            public EmbeddingStore<TextSegment> getObject(Object... args) {
                 return null;
             }
 
             @Override
-            public VectorStore getIfAvailable() {
+            public EmbeddingStore<TextSegment> getIfAvailable() {
                 return null;
             }
 
             @Override
-            public VectorStore getIfUnique() {
+            public EmbeddingStore<TextSegment> getIfUnique() {
                 return null;
             }
 
             @Override
-            public VectorStore getObject() {
+            public EmbeddingStore<TextSegment> getObject() {
                 return null;
             }
 
             @Override
-            public Stream<VectorStore> stream() {
+            public Stream<EmbeddingStore<TextSegment>> stream() {
                 return Stream.empty();
             }
 
             @Override
-            public Stream<VectorStore> orderedStream() {
+            public Stream<EmbeddingStore<TextSegment>> orderedStream() {
                 return Stream.empty();
             }
         };

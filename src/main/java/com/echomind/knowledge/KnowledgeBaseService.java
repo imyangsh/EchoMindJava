@@ -6,8 +6,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.ai.vectorstore.SearchRequest;
+import dev.langchain4j.data.document.Metadata;
+import dev.langchain4j.data.embedding.Embedding;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.store.embedding.EmbeddingMatch;
+import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
+import dev.langchain4j.store.embedding.EmbeddingStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
@@ -40,7 +44,7 @@ public class KnowledgeBaseService {
     private static final double BM25_B = 0.75;
 
     private final EchoMindProperties properties;
-    private final VectorStore vectorStore;
+    private final EmbeddingStore<TextSegment> vectorStore;
     private final ObjectMapper objectMapper;
     private final TextEmbeddingService embeddingService;
 
@@ -65,30 +69,27 @@ public class KnowledgeBaseService {
     /** 持久化文件损坏时置位，阻止默认文档覆盖写坏用户数据。 */
     private volatile boolean loadFailed = false;
 
-    public KnowledgeBaseService(EchoMindProperties properties, ObjectProvider<VectorStore> vectorStoreProvider, ObjectMapper objectMapper) {
+    public KnowledgeBaseService(EchoMindProperties properties, ObjectProvider<EmbeddingStore<TextSegment>> vectorStoreProvider, ObjectMapper objectMapper) {
         this(properties, vectorStoreProvider, objectMapper, TextEmbeddingService.hashOnly());
     }
 
     @Autowired
-    public KnowledgeBaseService(EchoMindProperties properties, ObjectProvider<VectorStore> vectorStoreProvider, ObjectMapper objectMapper, TextEmbeddingService embeddingService) {
+    public KnowledgeBaseService(EchoMindProperties properties, ObjectProvider<EmbeddingStore<TextSegment>> vectorStoreProvider, ObjectMapper objectMapper, TextEmbeddingService embeddingService) {
         this.properties = properties;
-        this.vectorStore = resolveVectorStore(vectorStoreProvider);
+        this.vectorStore = embeddingService.externalEmbeddingAvailable() ? resolveVectorStore(vectorStoreProvider) : null;
         this.objectMapper = objectMapper;
         this.embeddingService = embeddingService;
     }
 
     /**
-     * getIfAvailable() 只在 bean 定义不存在时返回 null；当 Chroma 自动配置的
-     * vectorStore bean 定义存在、但因缺少 EmbeddingModel（如 anthropic/deepseek
-     * profile）创建失败时，它会直接抛异常炸穿启动。这里捕获后降级为
-     * 本地 BM25 + hash 向量，兑现 README 承诺的回退行为。
+     * Chroma 延迟创建时仍可能因远端不可用抛异常；本地索引继续提供检索。
      */
-    private static VectorStore resolveVectorStore(ObjectProvider<VectorStore> provider) {
+    private static EmbeddingStore<TextSegment> resolveVectorStore(ObjectProvider<EmbeddingStore<TextSegment>> provider) {
         if (provider == null) return null;
         try {
             return provider.getIfAvailable();
         } catch (Exception ex) {
-            log.warn("Spring AI VectorStore unavailable ({}); falling back to local BM25 + hash vector retrieval",
+            log.warn("LangChain4j EmbeddingStore unavailable ({}); falling back to local BM25 + vector retrieval",
                     ex.getMessage());
             return null;
         }
@@ -166,7 +167,7 @@ public class KnowledgeBaseService {
                 corpusRevision.incrementAndGet();
             }
             deleteFromVectorStore(removed);
-            addToSpringAiVectorStore(embedded);
+            addToVectorStore(embedded);
             persistDocuments();
         }
         return pending.size();
@@ -218,12 +219,14 @@ public class KnowledgeBaseService {
     public RetrievalBatch searchDetailed(String query, int topK) {
         if (query == null || query.isBlank() || topK <= 0) return new RetrievalBatch(List.of(), false, lastBackend);
         QueryContext initialContext = queryContext(query);
-        if (vectorStore != null && (initialContext.vector().external() || !embeddingService.externalEmbeddingAvailable()) && !pendingVectorWrites.isEmpty()) {
+        if (vectorStore != null && initialContext.vector().external() && !pendingVectorWrites.isEmpty()) {
+            // Rebuild any hash vectors left by an ingestion outage before retrying the remote write.
+            ensureExternalSpace(initialContext.vector().space(), null);
             List<KnowledgeDocument> retry = pendingVectorWrites.keySet().stream().limit(EMBEDDING_BATCH_SIZE).map(index::get)
                     .filter(Objects::nonNull).map(IndexedDocument::doc).toList();
             if (synchronizeVectorStore(retry, false) && pendingVectorWrites.isEmpty()) persistDocuments();
         }
-        ChromaScores chroma = chromaScores(query, topK);
+        ChromaScores chroma = chromaScores(initialContext.vector(), topK);
         boolean vectorStoreSynced;
         synchronized (indexLock) { vectorStoreSynced = pendingVectorWrites.isEmpty(); }
         boolean usingChroma = chroma.succeeded() && !chroma.ranking().isEmpty() && vectorStoreSynced;
@@ -621,7 +624,7 @@ public class KnowledgeBaseService {
         return header + "\n" + doc.content();
     }
 
-    private void addToSpringAiVectorStore(List<KnowledgeDocument> documents) {
+    private void addToVectorStore(List<KnowledgeDocument> documents) {
         synchronizeVectorStore(documents, true);
     }
 
@@ -644,7 +647,12 @@ public class KnowledgeBaseService {
                 }
                 if (batch.isEmpty()) continue;
                 try {
-                    vectorStore.add(batch.stream().map(write -> new org.springframework.ai.document.Document(write.doc().id(), searchableText(write.doc()), write.doc().metadata())).toList());
+                    String space = batch.getFirst().doc().embedding() == null ? "" : batch.getFirst().doc().embedding().space();
+                    if (batch.stream().anyMatch(write -> write.doc().embedding() == null
+                            || !write.doc().embedding().external() || !space.equals(write.doc().embedding().space()))) continue;
+                    vectorStore.addAll(batch.stream().map(write -> write.doc().id()).toList(),
+                            batch.stream().map(write -> toEmbedding(write.doc().embedding())).toList(),
+                            batch.stream().map(write -> TextSegment.from(searchableText(write.doc()), new Metadata(write.doc().metadata()))).toList());
                     synchronized (indexLock) {
                         boolean changed = false;
                         for (VectorWrite write : batch) changed |= pendingVectorWrites.remove(write.doc().id(), write.generation());
@@ -652,7 +660,7 @@ public class KnowledgeBaseService {
                     }
                 } catch (Exception ex) {
                     observeBackend("chroma-write-failed");
-                    log.debug("Spring AI VectorStore batch write skipped: {}", ex.getMessage());
+                    log.debug("LangChain4j EmbeddingStore batch write skipped: {}", ex.getMessage());
                 }
             }
             return true;
@@ -665,8 +673,8 @@ public class KnowledgeBaseService {
 
     private void deleteFromVectorStore(List<String> ids) {
         if (vectorStore == null || ids.isEmpty()) return;
-        try { vectorStore.delete(ids); }
-        catch (Exception ex) { log.debug("Spring AI VectorStore stale chunk cleanup skipped: {}", ex.getMessage()); }
+        try { vectorStore.removeAll(ids); }
+        catch (Exception ex) { log.debug("LangChain4j EmbeddingStore stale chunk cleanup skipped: {}", ex.getMessage()); }
     }
 
     private List<KnowledgeDocument> embedDocuments(List<KnowledgeDocument> documents) {
@@ -751,7 +759,7 @@ public class KnowledgeBaseService {
             if (!missing.isEmpty()) {
                 List<KnowledgeDocument> rebuilt = embedDocuments(missing);
                 rebuilt.forEach(this::indexDocument);
-                addToSpringAiVectorStore(rebuilt);
+                addToVectorStore(rebuilt);
                 persistDocuments();
             }
             if (!index.isEmpty()) corpusRevision.incrementAndGet();
@@ -847,37 +855,52 @@ public class KnowledgeBaseService {
         return scores;
     }
 
-    private ChromaScores chromaScores(String query, int topK) {
-        if (vectorStore == null || query == null || query.isBlank()) {
+    private ChromaScores chromaScores(TextEmbeddingService.EmbeddingVector queryVector, int topK) {
+        if (vectorStore == null || queryVector == null || !queryVector.external()) {
             return new ChromaScores(Map.of(), Map.of(), vectorStore == null);
         }
         try {
-            SearchRequest request = SearchRequest.builder()
-                    .query(query)
-                    .topK(Math.max(1, topK))
-                    .similarityThreshold(0.0)
+            EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
+                    .queryEmbedding(toEmbedding(queryVector))
+                    .maxResults(Math.max(1, topK))
+                    .minScore(0.0)
                     .build();
-            List<org.springframework.ai.document.Document> results = vectorStore.similaritySearch(request);
+            List<EmbeddingMatch<TextSegment>> results = vectorStore.search(request).matches();
             Map<String, Double> scores = new HashMap<>();
             Map<String, Double> absolute = new HashMap<>();
             boolean complete = true;
             for (int i = 0; i < results.size(); i++) {
-                org.springframework.ai.document.Document doc = results.get(i);
-                String id = doc.getId();
+                EmbeddingMatch<TextSegment> match = results.get(i);
+                String id = match.embeddingId();
                 if (id == null || id.isBlank() || !index.containsKey(id)) {
                     // Stale remote chunks consume topK slots after a failed replacement cleanup.
                     complete = false;
                     continue;
                 }
-                double score = doc.getScore() == null ? 1.0 - (double) i / Math.max(1, results.size()) : clamp(doc.getScore());
+                // LangChain4j maps cosine [-1,1] to [0,1]. Use the returned vector's actual
+                // cosine for evidence so the existing RAG threshold keeps its meaning, also for L2 collections.
+                double score = match.embedding() == null ? clamp(2 * match.score() - 1)
+                        : clamp(embeddingService.cosine(queryVector.values(), toDoubleArray(match.embedding().vector())));
                 scores.put(id, Math.max(scores.getOrDefault(id, 0.0), score));
-                if (doc.getScore() != null) absolute.put(id, clamp(doc.getScore()));
+                absolute.put(id, score);
             }
             return new ChromaScores(scores, absolute, complete);
         } catch (Exception ex) {
-            log.debug("Spring AI VectorStore search skipped: {}", ex.getMessage());
+            log.debug("LangChain4j EmbeddingStore search skipped: {}", ex.getMessage());
             return new ChromaScores(Map.of(), Map.of(), false);
         }
+    }
+
+    private static Embedding toEmbedding(TextEmbeddingService.EmbeddingVector vector) {
+        float[] values = new float[vector.values().length];
+        for (int i = 0; i < values.length; i++) values[i] = (float) vector.values()[i];
+        return Embedding.from(values);
+    }
+
+    private static double[] toDoubleArray(float[] vector) {
+        double[] values = new double[vector.length];
+        for (int i = 0; i < values.length; i++) values[i] = vector[i];
+        return values;
     }
 
     private double clamp(double value) { return Double.isFinite(value) ? Math.max(0.0, Math.min(1.0, value)) : 0.0; }

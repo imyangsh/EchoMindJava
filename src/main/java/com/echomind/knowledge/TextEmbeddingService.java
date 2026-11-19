@@ -5,7 +5,8 @@ import com.knuddels.jtokkit.api.Encoding;
 import com.knuddels.jtokkit.api.EncodingType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.embedding.EmbeddingModel;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.embedding.EmbeddingModel;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -50,8 +51,8 @@ public class TextEmbeddingService {
     //"No default constructor found"
     @Autowired
     public TextEmbeddingService(ObjectProvider<EmbeddingModel> embeddingModelProvider,
-                                @Value("${spring.ai.openai.embedding.options.model:external}") String modelId,
-                                @Value("${spring.ai.openai.embedding.options.dimensions:0}") int configuredDimensions) {
+                                @Value("${langchain4j.embedding.model-name:external}") String modelId,
+                                @Value("${langchain4j.embedding.dimensions:0}") int configuredDimensions) {
         this(resolveEmbeddingModel(embeddingModelProvider), modelId, configuredDimensions);
     }
 
@@ -120,7 +121,8 @@ public class TextEmbeddingService {
     private EmbeddingVector computeEmbedding(String text) {
         if (embeddingModel != null) {
             try {
-                float[] output = embeddingModel.embed(text);
+                var response = embeddingModel.embed(text);
+                float[] output = response == null || response.content() == null ? null : response.content().vector();
                 if (output != null && output.length > 0) {
                     double[] values = toDoubleArray(output);
                     if (validValues(values) && (configuredDimensions <= 0 || output.length == configuredDimensions)) {
@@ -150,7 +152,9 @@ public class TextEmbeddingService {
         List<String> missing = texts.stream().filter(text -> !resolved.containsKey(text)).distinct().toList();
         if (!missing.isEmpty()) {
             try {
-                List<float[]> outputs = embeddingModel.embed(missing);
+                var response = embeddingModel.embedAll(missing.stream().map(TextSegment::from).toList());
+                List<float[]> outputs = response == null || response.content() == null ? null
+                        : response.content().stream().map(embedding -> embedding == null ? null : embedding.vector()).toList();
                 if (outputs == null || outputs.size() != missing.size()) throw new IllegalStateException("Invalid embedding batch size");
                 List<EmbeddingVector> computed = new ArrayList<>();
                 String space = null;
